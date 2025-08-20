@@ -2,7 +2,7 @@ name: Build and Push (GHCR)
 
 "on":
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -15,6 +15,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Create a lowercase image tag: ghcr.io/<owner>/<repo>:latest
+      - name: Compute lowercase image tag
+        shell: bash
+        run: |
+          echo "IMAGE_TAG=ghcr.io/${GITHUB_REPOSITORY,,}:latest" >> $GITHUB_ENV
+          echo "Resolved tag: ${GITHUB_REPOSITORY,,}:latest"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -34,8 +41,7 @@ jobs:
         with:
           context: .
           push: true
-          # 👇 force lowercase owner/repo for GHCR
-          tags: ghcr.io/${{ toLower(github.repository) }}:latest
+          tags: ${{ env.IMAGE_TAG }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
