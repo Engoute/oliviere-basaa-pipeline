@@ -16,7 +16,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Create a lowercase image tag: ghcr.io/<owner>/<repo>:latest
+      # Free ~20–30 GB on the runner (Android, .NET, Haskell, toolcache, swap)
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      # Also purge any dangling docker images from previous jobs (defensive)
+      - name: Extra prune (defensive)
+        run: |
+          docker system prune -af || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+
+      # Compute lowercase tag for GHCR
       - name: Compute lowercase image tag
         shell: bash
         run: |
@@ -36,12 +53,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push (with GHA cache)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }} 
+            org.opencontainers.image.revision=${{ github.sha }}
