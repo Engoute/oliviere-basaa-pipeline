@@ -1,3 +1,4 @@
+# /workspace/bootstrap.py
 import os
 import zipfile
 import shutil
@@ -52,7 +53,7 @@ def _resolve_model_dir(base: Path) -> Path:
             continue
         has_tok = (d / "tokenizer.json").exists()
         has_model = (d / "model.safetensors").exists() or any(d.glob("model-*.safetensors"))
-        score = (2 if has_tok else 0) + (1 if has_model else 0)
+        score = (2 if has_tok else 0) + (1 if has_model else 0)  # prefer both present
         candidates.append((score, d))
 
     if candidates:
