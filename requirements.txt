@@ -3,21 +3,21 @@ uvicorn[standard]==0.29.0
 websockets==12.0
 orjson==3.10.7
 
-# ASR
+# ASR (ct2 optional; we keep both paths available)
 faster-whisper==1.0.2
+ctranslate2==4.3.0
 soundfile==0.12.1
 
-# MT + LLM
-transformers>=4.43.0
+# MT + LLM (need >= 4.44 for custom TTS arch detection)
+transformers>=4.44.0
 accelerate>=0.33.0
 sentencepiece>=0.2.0
 safetensors>=0.4.3
+huggingface_hub>=0.24.0
+hf_transfer>=0.1.6   # so HF_HUB_ENABLE_HF_TRANSFER=1 never crashes
 
 # TTS
 git+https://github.com/hubertsiuzdak/snac.git@8f79a71
 
 # Audio utils
 torchaudio>=2.3.1
-
-# HF
-huggingface_hub>=0.23.2
