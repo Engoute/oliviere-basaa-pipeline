@@ -2,8 +2,7 @@ name: Build and Push (GHCR)
 
 "on":
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -35,4 +34,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:latest
+          # 👇 force lowercase owner/repo for GHCR
+          tags: ghcr.io/${{ toLower(github.repository) }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
