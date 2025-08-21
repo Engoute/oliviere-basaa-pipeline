@@ -3,19 +3,18 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Optional CT2 (ignored unless model.bin exists)
 try:
     from faster_whisper import WhisperModel as CT2WhisperModel  # type: ignore
 except Exception:
     CT2WhisperModel = None
 
-# Prefer native Whisper classes; fall back to auto-classes
 try:
     from transformers import (
         WhisperForConditionalGeneration,
         WhisperProcessor,
         WhisperTokenizer,
         WhisperFeatureExtractor,
+        GenerationConfig,  # <-- added
     )  # type: ignore
     _WHISPER_NATIVE = True
 except Exception:
@@ -23,6 +22,7 @@ except Exception:
         AutoModelForSpeechSeq2Seq,
         AutoTokenizer,
         AutoFeatureExtractor,
+        GenerationConfig,  # still available
     )  # type: ignore
     WhisperForConditionalGeneration = AutoModelForSpeechSeq2Seq  # type: ignore
     WhisperTokenizer = AutoTokenizer  # type: ignore
@@ -30,7 +30,7 @@ except Exception:
     WhisperProcessor = None  # type: ignore
     _WHISPER_NATIVE = False
 
-BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize → "lg"
+BASAA_ALIASES = {"lg", "bas", "basaa"}
 
 
 def _is_hf_dir(d: Path) -> bool:
@@ -48,9 +48,7 @@ def _resolve_hf_dir(base: Path) -> Path | None:
     for cfg in base.rglob("config.json"):
         d = cfg.parent
         score = (
-            2
-            if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists()
-            else 0
+            2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0
         ) + (1 if (d / "processor").exists() else 0)
         if score > best_score:
             best, best_score = d, score
@@ -62,7 +60,6 @@ class ASR:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        # Prefer symlink from bootstrap, then explicit path
         candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
             candidates.append(Path(base_path))
@@ -80,22 +77,18 @@ class ASR:
                     break
 
         if use_hf is not None:
-            # Processor (native or manual glue)
+            # processor / tokenizer / feature extractor
             if _WHISPER_NATIVE and WhisperProcessor is not None:
                 try:
                     self.proc = WhisperProcessor.from_pretrained(
                         str(use_hf), subfolder="processor", local_files_only=True
                     )
                 except Exception:
-                    self.proc = WhisperProcessor.from_pretrained(
-                        str(use_hf), local_files_only=True
-                    )
+                    self.proc = WhisperProcessor.from_pretrained(str(use_hf), local_files_only=True)
                 self.tok = self.proc.tokenizer
                 self.feat = self.proc.feature_extractor
             else:
-                self.tok = WhisperTokenizer.from_pretrained(
-                    str(use_hf), local_files_only=True
-                )
+                self.tok = WhisperTokenizer.from_pretrained(str(use_hf), local_files_only=True)
                 try:
                     self.feat = WhisperFeatureExtractor.from_pretrained(
                         str(use_hf), subfolder="processor", local_files_only=True
@@ -112,15 +105,21 @@ class ASR:
                 low_cpu_mem_usage=True,
             ).to(self.device).eval()
 
-            # Guard: generation_config.early_stopping must not be None
+            # ---- SAFE GENERATION CONFIG (avoids early_stopping=None) ----
             try:
-                gen = self.hf.generation_config
-                if getattr(gen, "early_stopping", None) is None:
-                    gen.early_stopping = False
-            except Exception:
-                pass
+                safe_gen = GenerationConfig.from_model_config(self.hf.config)
+                # force sane defaults if missing
+                if getattr(safe_gen, "early_stopping", None) is None:
+                    safe_gen.early_stopping = False
+                if getattr(safe_gen, "pad_token_id", None) is None:
+                    safe_gen.pad_token_id = self.tok.eos_token_id
+                if getattr(safe_gen, "eos_token_id", None) is None:
+                    safe_gen.eos_token_id = self.tok.eos_token_id
+                self.hf.generation_config = safe_gen
+            except Exception as e:
+                print(f"[asr] WARN: could not set safe GenerationConfig: {e}")
 
-            # Build language-token map
+            # language tokens
             self.lang_to_id = {}
             for code in (
                 "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
@@ -136,9 +135,7 @@ class ASR:
             return
 
         if use_ct2 is not None and CT2WhisperModel is not None:
-            self.ct2 = CT2WhisperModel(
-                str(use_ct2), device="cuda", compute_type="float16"
-            )
+            self.ct2 = CT2WhisperModel(str(use_ct2), device="cuda", compute_type="float16")
             self.backend = "ct2"
             print(f"[asr] using CT2 Whisper at: {use_ct2}")
             return
@@ -147,9 +144,7 @@ class ASR:
 
     @staticmethod
     def _pcm16_to_float(wav16k: bytes) -> np.ndarray:
-        return (
-            np.frombuffer(wav16k, dtype=np.int16).astype(np.float32) / 32768.0
-        )
+        return np.frombuffer(wav16k, dtype=np.int16).astype(np.float32) / 32768.0
 
     def _detect_lang_hf(self, feats):
         if not getattr(self, "lang_to_id", None):
@@ -160,9 +155,7 @@ class ASR:
         with torch.inference_mode():
             out = self.hf(input_features=feats, decoder_input_ids=dec)
             probs = torch.softmax(out.logits[:, -1, :], dim=-1)[0]
-        code, tid = max(
-            self.lang_to_id.items(), key=lambda kv: float(probs[kv[1]].item())
-        )
+        code, tid = max(self.lang_to_id.items(), key=lambda kv: float(probs[kv[1]].item()))
         return code, float(probs[tid].item())
 
     def _forced_ids(self, lang_code: str | None):
@@ -172,11 +165,7 @@ class ASR:
                 "<|startoftranscript|>",
                 (
                     f"<|{lang_code}|>"
-                    if (
-                        lang_code
-                        and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>")
-                        != self.tok.unk_token_id
-                    )
+                    if (lang_code and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>") != self.tok.unk_token_id)
                     else None
                 ),
                 "<|transcribe|>",
@@ -193,7 +182,6 @@ class ASR:
             return None
 
     def transcribe(self, wav16k: bytes):
-        # HF path
         pcm = self._pcm16_to_float(wav16k)
         feats = (
             self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
@@ -222,9 +210,5 @@ class ASR:
             )
 
         text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
-        code = (
-            "lg"
-            if (code or "unk").lower() in BASAA_ALIASES
-            else (code or "unk").lower()
-        )
+        code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
         return text, code, conf
