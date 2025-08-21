@@ -1,4 +1,3 @@
-# /workspace/app/asr_whisper.py
 from pathlib import Path
 import numpy as np
 import torch
@@ -59,9 +58,9 @@ class ASR:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        # 1) Prefer the HF symlink created by bootstrap
+        # Prefer the HF symlink created by bootstrap
         candidates: list[Path] = [Path("/data/models/whisper_hf_resolved")]
-        # 2) Then the env/config path passed in
+        # Then the env/config path passed in
         if base_path:
             candidates.append(Path(base_path))
 
