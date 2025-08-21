@@ -3,18 +3,20 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# Optional CT2 (ignored unless model.bin exists)
 try:
     from faster_whisper import WhisperModel as CT2WhisperModel  # type: ignore
 except Exception:
     CT2WhisperModel = None
 
+# Prefer native Whisper classes; fall back to auto-classes
 try:
     from transformers import (
         WhisperForConditionalGeneration,
         WhisperProcessor,
         WhisperTokenizer,
         WhisperFeatureExtractor,
-        GenerationConfig,  # <-- added
+        GenerationConfig,  # we will construct this ourselves
     )  # type: ignore
     _WHISPER_NATIVE = True
 except Exception:
@@ -22,7 +24,7 @@ except Exception:
         AutoModelForSpeechSeq2Seq,
         AutoTokenizer,
         AutoFeatureExtractor,
-        GenerationConfig,  # still available
+        GenerationConfig,
     )  # type: ignore
     WhisperForConditionalGeneration = AutoModelForSpeechSeq2Seq  # type: ignore
     WhisperTokenizer = AutoTokenizer  # type: ignore
@@ -30,7 +32,7 @@ except Exception:
     WhisperProcessor = None  # type: ignore
     _WHISPER_NATIVE = False
 
-BASAA_ALIASES = {"lg", "bas", "basaa"}
+BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize → "lg"
 
 
 def _is_hf_dir(d: Path) -> bool:
@@ -60,6 +62,7 @@ class ASR:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
+        # Prefer symlink from bootstrap, then explicit path
         candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
             candidates.append(Path(base_path))
@@ -98,6 +101,7 @@ class ASR:
                         str(use_hf), local_files_only=True
                     )
 
+            # MODEL LOAD (this is safe; we won't touch any generation_config on disk)
             self.hf = WhisperForConditionalGeneration.from_pretrained(
                 str(use_hf),
                 local_files_only=True,
@@ -105,19 +109,21 @@ class ASR:
                 low_cpu_mem_usage=True,
             ).to(self.device).eval()
 
-            # ---- SAFE GENERATION CONFIG (avoids early_stopping=None) ----
+            # 🔒 Install our own SAFE GenerationConfig (no reading from files/config)
+            safe_gen = GenerationConfig()
+            safe_gen.early_stopping = False
+            safe_gen.pad_token_id = self.tok.eos_token_id
+            safe_gen.eos_token_id = self.tok.eos_token_id
+            # If Transformers already set suppress lists internally, keep them if present.
             try:
-                safe_gen = GenerationConfig.from_model_config(self.hf.config)
-                # force sane defaults if missing
-                if getattr(safe_gen, "early_stopping", None) is None:
-                    safe_gen.early_stopping = False
-                if getattr(safe_gen, "pad_token_id", None) is None:
-                    safe_gen.pad_token_id = self.tok.eos_token_id
-                if getattr(safe_gen, "eos_token_id", None) is None:
-                    safe_gen.eos_token_id = self.tok.eos_token_id
-                self.hf.generation_config = safe_gen
-            except Exception as e:
-                print(f"[asr] WARN: could not set safe GenerationConfig: {e}")
+                g0 = getattr(self.hf, "generation_config", None)
+                if g0 is not None:
+                    for k in ("suppress_tokens", "begin_suppress_tokens"):
+                        if getattr(g0, k, None) is not None:
+                            setattr(safe_gen, k, getattr(g0, k))
+            except Exception:
+                pass
+            self.hf.generation_config = safe_gen
 
             # language tokens
             self.lang_to_id = {}
