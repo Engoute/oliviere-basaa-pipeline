@@ -3,13 +3,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# ---- Optional CT2 backend (used only if a CT2 bundle with model.bin is present) ----
+# Optional CT2 backend (ignored unless a CT2 bundle with model.bin exists)
 try:
     from faster_whisper import WhisperModel as CT2WhisperModel  # type: ignore
 except Exception:
     CT2WhisperModel = None
 
-# ---- Try native Whisper classes; fall back to auto-classes + manual glue ----
+# Try native Whisper classes; fall back to auto-classes + manual glue
 try:
     from transformers import (
         WhisperForConditionalGeneration,
@@ -30,104 +30,85 @@ except Exception:
     WhisperProcessor = None  # type: ignore
     _WHISPER_NATIVE = False
 
-
 BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize any of these → "lg"
 
 
-def _resolve_whisper_dir(base: Path):
-    """
-    Return (use_path, kind) where kind ∈ {"hf","ct2"} by scanning nested folders.
-    Priority: CT2 model.bin if present, otherwise HF (config.json + tokenizer/processor).
-    """
-    if not base or not base.exists():
-        return None, None
+def _is_hf_dir(d: Path) -> bool:
+    return (d / "config.json").exists() and (
+        (d / "tokenizer.json").exists()
+        or (d / "tokenizer_config.json").exists()
+        or (d / "processor").exists()
+    )
 
-    # 1) CT2 at root?
-    if (base / "model.bin").exists():
-        return base, "ct2"
 
-    # 2) HF at root?
-    if (base / "config.json").exists():
-        # consider it HF if tokenizer or processor files are around
-        if (base / "tokenizer.json").exists() or (base / "tokenizer_config.json").exists() or (base / "processor").exists():
-            return base, "hf"
-
-    # 3) Scan nested: prefer CT2 model.bin
-    ct2_bins = list(base.rglob("model.bin"))
-    if ct2_bins:
-        return ct2_bins[0].parent, "ct2"
-
-    # 4) Scan nested HF: config.json with tokenizer/processor nearby
-    cand = None
-    best_score = -1
+def _resolve_hf_dir(base: Path) -> Path | None:
+    if _is_hf_dir(base):
+        return base
+    best, best_score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
-        has_tok = (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists()
-        has_proc = (d / "processor").exists()
-        # more evidence -> higher score
-        score = (2 if has_tok else 0) + (1 if has_proc else 0)
+        score = (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
+                + (1 if (d / "processor").exists() else 0)
         if score > best_score:
-            cand, best_score = d, score
-    if cand is not None:
-        return cand, "hf"
-
-    return None, None
+            best, best_score = d, score
+    return best
 
 
 class ASR:
     def __init__(self, base_path: str):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
-        p = Path(base_path) if base_path else None
 
-        use, kind = _resolve_whisper_dir(p) if p else (None, None)
+        # 1) Prefer the HF symlink created by bootstrap
+        candidates: list[Path] = [Path("/data/models/whisper_hf_resolved")]
+        # 2) Then the env/config path passed in
+        if base_path:
+            candidates.append(Path(base_path))
 
-        # ---- Prefer CT2 if detected and CT2 is installed ----
-        if kind == "ct2":
-            if CT2WhisperModel is None:
-                raise RuntimeError("CT2 bundle found but faster-whisper is not installed.")
-            self.ct2 = CT2WhisperModel(str(use), device="cuda", compute_type="float16")
-            self.backend = "ct2"
-            print(f"[asr] using CT2 model at: {use}")
-            return
+        use_hf = None
+        use_ct2 = None
+        for c in candidates:
+            if c.exists():
+                if (c / "model.bin").exists():
+                    use_ct2 = c
+                    break
+                d = _resolve_hf_dir(c)
+                if d is not None:
+                    use_hf = d
+                    break
 
-        # ---- HF merged checkpoint (your bundle) ----
-        if kind == "hf":
+        # HF is the design target
+        if use_hf is not None:
             # Processor (native or manual)
             if _WHISPER_NATIVE and WhisperProcessor is not None:
                 try:
                     self.proc = WhisperProcessor.from_pretrained(
-                        str(use), subfolder="processor", local_files_only=True
+                        str(use_hf), subfolder="processor", local_files_only=True
                     )
                     self.tok = self.proc.tokenizer
                     self.feat = self.proc.feature_extractor
                 except Exception:
-                    # fallback: try root if no /processor
                     self.proc = WhisperProcessor.from_pretrained(
-                        str(use), local_files_only=True
+                        str(use_hf), local_files_only=True
                     )
                     self.tok = self.proc.tokenizer
                     self.feat = self.proc.feature_extractor
             else:
-                self.tok = WhisperTokenizer.from_pretrained(str(use), local_files_only=True)
-                # prefer subfolder=processor; fallback root
+                self.tok = WhisperTokenizer.from_pretrained(str(use_hf), local_files_only=True)
                 try:
                     self.feat = WhisperFeatureExtractor.from_pretrained(
-                        str(use), subfolder="processor", local_files_only=True
+                        str(use_hf), subfolder="processor", local_files_only=True
                     )
                 except Exception:
                     self.feat = WhisperFeatureExtractor.from_pretrained(
-                        str(use), local_files_only=True
+                        str(use_hf), local_files_only=True
                     )
 
             self.hf = WhisperForConditionalGeneration.from_pretrained(
-                str(use),
-                local_files_only=True,
-                torch_dtype=self.dtype,
-                low_cpu_mem_usage=True,
+                str(use_hf), local_files_only=True, torch_dtype=self.dtype, low_cpu_mem_usage=True
             ).to(self.device).eval()
 
-            # Build language-token map once
+            # Build language-token map
             self.lang_to_id = {}
             for code in (
                 "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
@@ -139,11 +120,17 @@ class ASR:
                     self.lang_to_id[code] = tid
 
             self.backend = "hf"
-            print(f"[asr] using HF model at: {use}")
+            print(f"[asr] using HF Whisper at: {use_hf}")
             return
 
-        # ---- Nothing found ----
-        raise RuntimeError("No Whisper backend available.")
+        # Optional CT2 fallback (only if you later add a CT2 bundle)
+        if use_ct2 is not None and CT2WhisperModel is not None:
+            self.ct2 = CT2WhisperModel(str(use_ct2), device="cuda", compute_type="float16")
+            self.backend = "ct2"
+            print(f"[asr] using CT2 Whisper at: {use_ct2}")
+            return
+
+        raise RuntimeError("No Whisper backend available (HF bundle not found).")
 
     @staticmethod
     def _pcm16_to_float(wav16k: bytes) -> np.ndarray:
@@ -162,75 +149,40 @@ class ASR:
         return code, float(probs[tid].item())
 
     def _forced_ids(self, lang_code: str | None):
-        """
-        Build forced decoder ids similar to WhisperProcessor.get_decoder_prompt_ids().
-        Layout: <|startoftranscript|> [<|xx|>] <|transcribe|> <|notimestamps|>
-        """
         try:
-            ids = []
-            pos = 0
+            ids, pos = [], 0
             for tok in [
                 "<|startoftranscript|>",
                 (f"<|{lang_code}|>" if (lang_code and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>") != self.tok.unk_token_id) else None),
-                "<|transcribe|>",
-                "<|notimestamps|>",
+                "<|transcribe|>", "<|notimestamps|>",
             ]:
-                if tok is None:
-                    continue
+                if tok is None: continue
                 tid = self.tok.convert_tokens_to_ids(tok)
                 if isinstance(tid, int) and tid >= 0:
-                    ids.append((pos, tid))
-                    pos += 1
-            return ids if ids else None
+                    ids.append((pos, tid)); pos += 1
+            return ids or None
         except Exception:
             return None
 
     def transcribe(self, wav16k: bytes):
-        # ---- CT2 path ----
-        if getattr(self, "backend", None) == "ct2":
-            pcm = self._pcm16_to_float(wav16k)
-            segs, info = self.ct2.transcribe(
-                pcm, language=None, beam_size=1, vad_filter=True, temperature=0.0
-            )
-            text = " ".join(s.text.strip() for s in segs).strip()
-            code = (info.language or "unk").lower()
-            code = "lg" if code in BASAA_ALIASES else code
-            conf = float(getattr(info, "language_probability", 0.0) or 0.0)
-            return text, code, conf
-
-        # ---- HF merged path ----
+        # HF path
         pcm = self._pcm16_to_float(wav16k)
-        feats = (
-            self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
-            .input_features.to(self.device)
-            .to(self.hf.dtype)  # match model dtype (fp16 on GPU)
-        )
-
+        feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
+                 .input_features.to(self.device).to(self.hf.dtype))
         code, conf = self._detect_lang_hf(feats)
-
-        # Set forced decoder ids (manual)
         forced = self._forced_ids(code if code != "unk" else None)
         try:
             self.hf.generation_config.forced_decoder_ids = forced
         except Exception:
             self.hf.generation_config.forced_decoder_ids = None
-
-        # Safe token budget: respect max_target_positions
         max_target = int(getattr(self.hf.config, "max_target_positions", 448) or 448)
         forced_len = len(forced) if forced else 2
         safe_new = max(1, min(400, max_target - forced_len - 1))
-
         with torch.inference_mode():
             out = self.hf.generate(
-                feats,
-                do_sample=False,
-                num_beams=1,
-                max_new_tokens=safe_new,
-                pad_token_id=self.tok.eos_token_id,
-                eos_token_id=self.tok.eos_token_id,
+                feats, do_sample=False, num_beams=1, max_new_tokens=safe_new,
+                pad_token_id=self.tok.eos_token_id, eos_token_id=self.tok.eos_token_id,
             )
-
-        # Decode
         text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
         code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
         return text, code, conf
