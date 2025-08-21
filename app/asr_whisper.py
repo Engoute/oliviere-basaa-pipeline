@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# ---- Optional CT2 backend (only used if a CT2 bundle is present) ----
+# ---- Optional CT2 backend (used only if a CT2 bundle with model.bin is present) ----
 try:
     from faster_whisper import WhisperModel as CT2WhisperModel  # type: ignore
 except Exception:
@@ -34,43 +34,97 @@ except Exception:
 BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize any of these → "lg"
 
 
+def _resolve_whisper_dir(base: Path):
+    """
+    Return (use_path, kind) where kind ∈ {"hf","ct2"} by scanning nested folders.
+    Priority: CT2 model.bin if present, otherwise HF (config.json + tokenizer/processor).
+    """
+    if not base or not base.exists():
+        return None, None
+
+    # 1) CT2 at root?
+    if (base / "model.bin").exists():
+        return base, "ct2"
+
+    # 2) HF at root?
+    if (base / "config.json").exists():
+        # consider it HF if tokenizer or processor files are around
+        if (base / "tokenizer.json").exists() or (base / "tokenizer_config.json").exists() or (base / "processor").exists():
+            return base, "hf"
+
+    # 3) Scan nested: prefer CT2 model.bin
+    ct2_bins = list(base.rglob("model.bin"))
+    if ct2_bins:
+        return ct2_bins[0].parent, "ct2"
+
+    # 4) Scan nested HF: config.json with tokenizer/processor nearby
+    cand = None
+    best_score = -1
+    for cfg in base.rglob("config.json"):
+        d = cfg.parent
+        has_tok = (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists()
+        has_proc = (d / "processor").exists()
+        # more evidence -> higher score
+        score = (2 if has_tok else 0) + (1 if has_proc else 0)
+        if score > best_score:
+            cand, best_score = d, score
+    if cand is not None:
+        return cand, "hf"
+
+    return None, None
+
+
 class ASR:
     def __init__(self, base_path: str):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
         p = Path(base_path) if base_path else None
 
-        # ---- Prefer CT2 if present (model.bin) and CT2 is installed ----
-        if p and (p / "model.bin").exists() and CT2WhisperModel is not None:
-            self.ct2 = CT2WhisperModel(str(p), device="cuda", compute_type="float16")
+        use, kind = _resolve_whisper_dir(p) if p else (None, None)
+
+        # ---- Prefer CT2 if detected and CT2 is installed ----
+        if kind == "ct2":
+            if CT2WhisperModel is None:
+                raise RuntimeError("CT2 bundle found but faster-whisper is not installed.")
+            self.ct2 = CT2WhisperModel(str(use), device="cuda", compute_type="float16")
             self.backend = "ct2"
+            print(f"[asr] using CT2 model at: {use}")
             return
 
         # ---- HF merged checkpoint (your bundle) ----
-        if p and ((p / "model.safetensors.index.json").exists() or any(p.glob("model-*.safetensors"))):
+        if kind == "hf":
+            # Processor (native or manual)
             if _WHISPER_NATIVE and WhisperProcessor is not None:
-                proc = WhisperProcessor.from_pretrained(
-                    str(p), subfolder="processor", local_files_only=True
-                )
-                self.tok = proc.tokenizer
-                self.feat = proc.feature_extractor
+                try:
+                    self.proc = WhisperProcessor.from_pretrained(
+                        str(use), subfolder="processor", local_files_only=True
+                    )
+                    self.tok = self.proc.tokenizer
+                    self.feat = self.proc.feature_extractor
+                except Exception:
+                    # fallback: try root if no /processor
+                    self.proc = WhisperProcessor.from_pretrained(
+                        str(use), local_files_only=True
+                    )
+                    self.tok = self.proc.tokenizer
+                    self.feat = self.proc.feature_extractor
             else:
-                # Manual processor: tokenizer + feature_extractor
-                self.tok = WhisperTokenizer.from_pretrained(
-                    str(p), local_files_only=True
-                )
-                # try subfolder="processor" first (your bundle layout), then root
+                self.tok = WhisperTokenizer.from_pretrained(str(use), local_files_only=True)
+                # prefer subfolder=processor; fallback root
                 try:
                     self.feat = WhisperFeatureExtractor.from_pretrained(
-                        str(p), subfolder="processor", local_files_only=True
+                        str(use), subfolder="processor", local_files_only=True
                     )
                 except Exception:
                     self.feat = WhisperFeatureExtractor.from_pretrained(
-                        str(p), local_files_only=True
+                        str(use), local_files_only=True
                     )
 
             self.hf = WhisperForConditionalGeneration.from_pretrained(
-                str(p), local_files_only=True, torch_dtype=self.dtype, low_cpu_mem_usage=True
+                str(use),
+                local_files_only=True,
+                torch_dtype=self.dtype,
+                low_cpu_mem_usage=True,
             ).to(self.device).eval()
 
             # Build language-token map once
@@ -85,14 +139,11 @@ class ASR:
                     self.lang_to_id[code] = tid
 
             self.backend = "hf"
+            print(f"[asr] using HF model at: {use}")
             return
 
-        # ---- Last resort: stock CT2 (keeps API alive) ----
-        if CT2WhisperModel is not None:
-            self.ct2 = CT2WhisperModel("large-v3", device="cuda", compute_type="float16")
-            self.backend = "ct2"
-        else:
-            raise RuntimeError("No Whisper backend available.")
+        # ---- Nothing found ----
+        raise RuntimeError("No Whisper backend available.")
 
     @staticmethod
     def _pcm16_to_float(wav16k: bytes) -> np.ndarray:
@@ -114,7 +165,6 @@ class ASR:
         """
         Build forced decoder ids similar to WhisperProcessor.get_decoder_prompt_ids().
         Layout: <|startoftranscript|> [<|xx|>] <|transcribe|> <|notimestamps|>
-        Returns a list of (position, token_id) pairs or None.
         """
         try:
             ids = []
@@ -158,18 +208,8 @@ class ASR:
 
         code, conf = self._detect_lang_hf(feats)
 
-        # Set forced decoder ids (either via real processor or manual)
-        forced = None
-        # If native processor exists, try using its method through a tiny shim
-        if _WHISPER_NATIVE and hasattr(self, "proc"):  # not used currently, kept for clarity
-            try:
-                forced = self.proc.get_decoder_prompt_ids(
-                    language=code if code != "unk" else None, task="transcribe"
-                )
-            except Exception:
-                forced = None
-        if forced is None:
-            forced = self._forced_ids(code if code != "unk" else None)
+        # Set forced decoder ids (manual)
+        forced = self._forced_ids(code if code != "unk" else None)
         try:
             self.hf.generation_config.forced_decoder_ids = forced
         except Exception:
