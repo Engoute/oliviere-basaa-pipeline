@@ -1,3 +1,4 @@
+# app/asr_whisper.py
 from pathlib import Path
 import numpy as np
 import torch
@@ -31,6 +32,7 @@ except Exception:
 
 BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize → "lg"
 
+
 def _is_hf_dir(d: Path) -> bool:
     return (d / "config.json").exists() and (
         (d / "tokenizer.json").exists()
@@ -38,17 +40,22 @@ def _is_hf_dir(d: Path) -> bool:
         or (d / "processor").exists()
     )
 
+
 def _resolve_hf_dir(base: Path) -> Path | None:
     if _is_hf_dir(base):
         return base
     best, best_score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
-        score = (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
-                + (1 if (d / "processor").exists() else 0)
+        score = (
+            2
+            if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists()
+            else 0
+        ) + (1 if (d / "processor").exists() else 0)
         if score > best_score:
             best, best_score = d, score
     return best
+
 
 class ASR:
     def __init__(self, base_path: str):
@@ -80,11 +87,15 @@ class ASR:
                         str(use_hf), subfolder="processor", local_files_only=True
                     )
                 except Exception:
-                    self.proc = WhisperProcessor.from_pretrained(str(use_hf), local_files_only=True)
+                    self.proc = WhisperProcessor.from_pretrained(
+                        str(use_hf), local_files_only=True
+                    )
                 self.tok = self.proc.tokenizer
                 self.feat = self.proc.feature_extractor
             else:
-                self.tok = WhisperTokenizer.from_pretrained(str(use_hf), local_files_only=True)
+                self.tok = WhisperTokenizer.from_pretrained(
+                    str(use_hf), local_files_only=True
+                )
                 try:
                     self.feat = WhisperFeatureExtractor.from_pretrained(
                         str(use_hf), subfolder="processor", local_files_only=True
@@ -95,7 +106,10 @@ class ASR:
                     )
 
             self.hf = WhisperForConditionalGeneration.from_pretrained(
-                str(use_hf), local_files_only=True, torch_dtype=self.dtype, low_cpu_mem_usage=True
+                str(use_hf),
+                local_files_only=True,
+                torch_dtype=self.dtype,
+                low_cpu_mem_usage=True,
             ).to(self.device).eval()
 
             # Guard: generation_config.early_stopping must not be None
@@ -122,7 +136,9 @@ class ASR:
             return
 
         if use_ct2 is not None and CT2WhisperModel is not None:
-            self.ct2 = CT2WhisperModel(str(use_ct2), device="cuda", compute_type="float16")
+            self.ct2 = CT2WhisperModel(
+                str(use_ct2), device="cuda", compute_type="float16"
+            )
             self.backend = "ct2"
             print(f"[asr] using CT2 Whisper at: {use_ct2}")
             return
@@ -131,7 +147,9 @@ class ASR:
 
     @staticmethod
     def _pcm16_to_float(wav16k: bytes) -> np.ndarray:
-        return (np.frombuffer(wav16k, dtype=np.int16).astype(np.float32) / 32768.0)
+        return (
+            np.frombuffer(wav16k, dtype=np.int16).astype(np.float32) / 32768.0
+        )
 
     def _detect_lang_hf(self, feats):
         if not getattr(self, "lang_to_id", None):
@@ -142,7 +160,9 @@ class ASR:
         with torch.inference_mode():
             out = self.hf(input_features=feats, decoder_input_ids=dec)
             probs = torch.softmax(out.logits[:, -1, :], dim=-1)[0]
-        code, tid = max(self.lang_to_id.items(), key=lambda kv: float(probs[kv[1]].item()))
+        code, tid = max(
+            self.lang_to_id.items(), key=lambda kv: float(probs[kv[1]].item())
+        )
         return code, float(probs[tid].item())
 
     def _forced_ids(self, lang_code: str | None):
@@ -150,31 +170,61 @@ class ASR:
             ids, pos = [], 0
             for tok in [
                 "<|startoftranscript|>",
-                (f"<|{lang_code}|>" if (lang_code and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>") != self.tok.unk_token_id) else None),
-                "<|transcribe|>", "<|notimestamps|>",
+                (
+                    f"<|{lang_code}|>"
+                    if (
+                        lang_code
+                        and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>")
+                        != self.tok.unk_token_id
+                    )
+                    else None
+                ),
+                "<|transcribe|>",
+                "<|notimestamps|>",
             ]:
-                if tok is None: continue
+                if tok is None:
+                    continue
                 tid = self.tok.convert_tokens_to_ids(tok)
                 if isinstance(tid, int) and tid >= 0:
-                    ids.append((pos, tid)); pos += 1
+                    ids.append((pos, tid))
+                    pos += 1
             return ids or None
         except Exception:
             return None
 
     def transcribe(self, wav16k: bytes):
+        # HF path
         pcm = self._pcm16_to_float(wav16k)
-        feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
-                 .input_features.to(self.device).to(self.hf.dtype))
+        feats = (
+            self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
+            .input_features.to(self.device)
+            .to(self.hf.dtype)
+        )
         code, conf = self._detect_lang_hf(feats)
         forced = self._forced_ids(code if code != "unk" else None)
         try:
             self.hf.generation_config.forced_decoder_ids = forced
         except Exception:
             self.hf.generation_config.forced_decoder_ids = None
+
         max_target = int(getattr(self.hf.config, "max_target_positions", 448) or 448)
         forced_len = len(forced) if forced else 2
         safe_new = max(1, min(400, max_target - forced_len - 1))
+
         with torch.inference_mode():
             out = self.hf.generate(
-                feats, do_sample=False, num_beams=1, max_new_tokens=safe_new,
-                pad_token_id=self.tok.eos_token_id, eos_token_id
+                feats,
+                do_sample=False,
+                num_beams=1,
+                max_new_tokens=safe_new,
+                pad_token_id=self.tok.eos_token_id,
+                eos_token_id=self.tok.eos_token_id,
+            )
+
+        text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+        code = (
+            "lg"
+            if (code or "unk").lower() in BASAA_ALIASES
+            else (code or "unk").lower()
+        )
+        return text, code, conf
