@@ -1,11 +1,9 @@
-# app/asr_whisper.py
+# FILE: app/asr_whisper.py
 from __future__ import annotations
-
-import numpy as np
 from pathlib import Path
+import numpy as np
 import torch
 
-# Prefer native Whisper classes; fall back to auto-classes if needed
 try:
     from transformers import (
         WhisperForConditionalGeneration,
@@ -15,6 +13,7 @@ try:
     )
     _NATIVE = True
 except Exception:
+    # Fallback generics if needed
     from transformers import (
         AutoModelForSpeechSeq2Seq as WhisperForConditionalGeneration,
         AutoTokenizer as WhisperTokenizer,
@@ -23,59 +22,49 @@ except Exception:
     WhisperProcessor = None  # type: ignore
     _NATIVE = False
 
-__all__ = ["ASR"]   # ← guarantees `from .asr_whisper import ASR` finds it
+__all__ = ["ASR"]
 
-BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize → "lg"
+# Treat unknown Basaa detections as "lg"
+BASAA_ALIASES = {"lg", "bas", "basaa"}
 
 def _is_hf_dir(d: Path) -> bool:
     return (d / "config.json").exists() and (
-        (d / "tokenizer.json").exists()
+        (d / "processor").exists()
+        or (d / "tokenizer.json").exists()
         or (d / "tokenizer_config.json").exists()
-        or (d / "processor").exists()
     )
 
 def _resolve_hf_dir(base: Path) -> Path | None:
     if _is_hf_dir(base):
         return base
-    best, best_score = None, -1
+    best, score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
-        score = (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
-                + (1 if (d / "processor").exists() else 0)
-        if score > best_score:
-            best, best_score = d, score
+        s = (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
+            + (1 if (d / "processor").exists() else 0)
+        if s > score:
+            best, score = d, s
     return best
 
 class ASR:
-    """
-    HF Whisper (merged LoRA). Expects a directory with:
-      - config.json, model-*.safetensors, model.safetensors.index.json
-      - processor/ (tokenizer + feature extractor)
-    bootstrap.py creates /data/models/whisper_hf_resolved -> the real folder.
-    """
     def __init__(self, base_path: str | None):
-        print("[asr] importing app.asr_whisper…")  # visible on module import
+        print("[asr] importing app.asr_whisper…")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
-        # Prefer the stable symlink created by bootstrap
-        candidates: list[Path] = [Path("/data/models/whisper_hf_resolved")]
+        candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
-            candidates.append(Path(base_path))
-
+            candidates.insert(0, Path(base_path))
         use = None
         for c in candidates:
             if c.exists():
                 d = _resolve_hf_dir(c)
                 if d is not None:
-                    use = d
-                    break
+                    use = d; break
         if use is None:
             raise RuntimeError(f"HF Whisper not found under {candidates}")
 
-        # Processor (native or manual)
         if _NATIVE and WhisperProcessor is not None:
-            # Try subfolder=processor first, else root
             try:
                 self.proc = WhisperProcessor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
             except Exception:
@@ -89,7 +78,6 @@ class ASR:
             except Exception:
                 self.feat = WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
 
-        # Model
         self.hf = WhisperForConditionalGeneration.from_pretrained(
             str(use),
             local_files_only=True,
@@ -97,7 +85,7 @@ class ASR:
             low_cpu_mem_usage=True,
         ).to(self.device).eval()
 
-        # Language tokens
+        # Build language token -> id map (include "lg"/Basaa aliases)
         self.lang_to_id = {}
         for code in (
             "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
@@ -133,7 +121,6 @@ class ASR:
 
         code, conf = self._detect_lang(feats)
 
-        # Build forced ids manually (don’t trust generation_config)
         def _forced_ids(lang_code: str | None):
             ids, pos = [], 0
             for tok in [
@@ -164,7 +151,7 @@ class ASR:
                 max_new_tokens=safe_new,
                 pad_token_id=self.tok.eos_token_id,
                 eos_token_id=self.tok.eos_token_id,
-                early_stopping=True,       # avoid config None issues
+                early_stopping=True,
             )
         text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
         code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
