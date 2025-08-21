@@ -5,6 +5,7 @@ import tempfile
 import urllib.request
 import json
 from pathlib import Path
+from typing import Optional
 
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/data/models"))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,7 +59,7 @@ def _resolve_orpheus_dir(base: Path) -> Path:
     return matches[0].parent if matches else base
 
 
-def _resolve_whisper_hf_dir(base: Path) -> Path | None:
+def _resolve_whisper_hf_dir(base: Path) -> Optional[Path]:
     """
     Resolve an HF Whisper folder: needs config.json and either tokenizer.json/tokenizer_config.json
     or a 'processor' subfolder. Works with nested layouts.
@@ -102,32 +103,38 @@ def _env_path(name: str, default_subdir: str) -> Path:
     return p
 
 
-def _patch_generation_config(model_dir: Path):
-    """
-    Some merges include generation_config.json with invalid values (e.g., early_stopping: null).
-    Patch it in-place to avoid strict validation errors, or rename it as a fallback.
-    """
-    gc = model_dir / "generation_config.json"
-    if not gc.exists():
-        return
+def _patch_generation_config_file(gc_path: Path):
     try:
-        cfg = json.loads(gc.read_text())
+        cfg = json.loads(gc_path.read_text())
+        changed = False
+
         # Fix invalid early_stopping
-        if cfg.get("early_stopping", None) is None:
-            cfg["early_stopping"] = "never"  # valid values: True, False, or 'never'
-        # Drop forced ids that can fight our runtime args (optional)
+        if cfg.get("early_stopping", None) is None or cfg.get("early_stopping") not in (True, False, "never"):
+            cfg["early_stopping"] = "never"
+            changed = True
+
+        # Strip fragile forced tokens that can conflict with runtime
         for k in ("forced_decoder_ids", "forced_bos_token_id", "forced_eos_token_id"):
             if k in cfg:
                 cfg.pop(k, None)
-        gc.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-        print(f"[bootstrap] patched generation_config.json in {model_dir}")
+                changed = True
+
+        if changed:
+            gc_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+            print(f"[bootstrap] patched {gc_path}")
     except Exception as e:
-        # Last resort: disable the file so Transformers derives defaults
+        # If anything goes wrong, disable the file so Transformers uses defaults
         try:
-            gc.rename(model_dir / "generation_config.json.disabled")
-            print(f"[bootstrap] renamed invalid generation_config.json in {model_dir}: {e}")
+            gc_path.rename(gc_path.with_suffix(gc_path.suffix + ".disabled"))
+            print(f"[bootstrap] renamed invalid {gc_path} → *.disabled ({e})")
         except Exception as e2:
-            print(f"[bootstrap] WARN: could not patch or rename generation_config.json: {e2}")
+            print(f"[bootstrap] WARN: could not patch or rename {gc_path}: {e2}")
+
+
+def _patch_generation_config_tree(root: Path):
+    # Patch generation_config.json in root and recursively under it
+    for gc in list(root.glob("generation_config.json")) + list(root.rglob("generation_config.json")):
+        _patch_generation_config_file(gc)
 
 
 def main():
@@ -158,17 +165,13 @@ def main():
     else:
         print(f"[bootstrap] Orpheus resolved → {orp_real}")
 
-    # Whisper HF: resolve & link, then PATCH its generation_config.json
+    # Whisper HF: resolve & link
     wh_real = _resolve_whisper_hf_dir(path_whisper)
     if wh_real is None:
         print(f"[bootstrap] ERROR: could not resolve HF Whisper under {path_whisper}")
     else:
         _mk_symlink("whisper_hf_resolved", wh_real)
         print(f"[bootstrap] Whisper HF resolved → {wh_real}")
-        _patch_generation_config(wh_real)  # <-- NEW: sanitize or disable invalid gen config
 
-    print("[bootstrap] Done.")
-
-
-if __name__ == "__main__":
-    main()
+    # --- GLOBAL PATCH: sanitize gen configs everywhere ---
+    for root in {path_qwen, path_whisper,
