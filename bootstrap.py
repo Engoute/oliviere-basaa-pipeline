@@ -1,9 +1,4 @@
-import os
-import zipfile
-import shutil
-import tempfile
-import urllib.request
-import json
+import os, zipfile, shutil, tempfile, urllib.request, json
 from pathlib import Path
 
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/data/models"))
@@ -85,28 +80,26 @@ def _env_path(name: str, default_subdir: str) -> Path:
     print(f"[bootstrap] {name} = {p}")
     return p
 
-def _fix_generation_config(root: Path):
-    """
-    Whisper safety: if generation_config.json exists and has early_stopping=null,
-    set it to false (or back up and remove the file).
-    """
-    gc = root / "generation_config.json"
-    if not gc.exists():
-        return
-    try:
-        data = json.loads(gc.read_text())
-        if data.get("early_stopping", None) is None:
-            data["early_stopping"] = False
-            gc.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-            print("[bootstrap] patched Whisper generation_config.json (early_stopping=false).")
-    except Exception as e:
-        # worst case: remove the file so Transformers builds defaults
-        try:
-            bak = gc.with_suffix(".json.bak")
-            gc.rename(bak)
-            print(f"[bootstrap] WARN: could not parse/persist generation_config; moved to {bak}: {e}")
-        except Exception as e2:
-            print(f"[bootstrap] WARN: failed to remove problematic generation_config.json: {e2}")
+def _patch_early_stopping(root: Path):
+    """Recursively patch generation_config.json and config.json with early_stopping=null → false."""
+    changed = 0
+    for fname in ("generation_config.json", "config.json"):
+        for fp in root.rglob(fname):
+            try:
+                data = json.loads(fp.read_text())
+                if data.get("early_stopping", None) is None:
+                    data["early_stopping"] = False
+                    fp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+                    changed += 1
+            except Exception as e:
+                try:
+                    bak = fp.with_suffix(fp.suffix + ".bak")
+                    fp.rename(bak)
+                    print(f"[bootstrap] WARN: {fp} invalid; moved to {bak} ({e})")
+                except Exception as e2:
+                    print(f"[bootstrap] WARN: failed to handle {fp}: {e2}")
+    if changed:
+        print(f"[bootstrap] patched early_stopping in {changed} file(s) under {root}")
 
 def main():
     _guard_hf_transfer()
@@ -126,7 +119,6 @@ def main():
     if m2m_url:     fetch_and_unzip(m2m_url,     path_m2m)
     if orpheus_url: fetch_and_unzip(orpheus_url, path_orpheus)
 
-    # Orpheus resolve + link
     orp_real = _resolve_orpheus_dir(path_orpheus)
     _mk_symlink("orpheus_3b_resolved", orp_real)
     if (orp_real / "config.json").exists():
@@ -134,13 +126,13 @@ def main():
     else:
         print(f"[bootstrap] WARN: Orpheus config.json not found under {orp_real}")
 
-    # Whisper resolve + link + **sanitize gen config**
     wh_real = _resolve_whisper_hf_dir(path_whisper)
     if wh_real is None:
         print(f"[bootstrap] ERROR: could not resolve HF Whisper under {path_whisper}")
     else:
+        # ✅ sanitize all ‘early_stopping’ before app import touches transformers
+        _patch_early_stopping(wh_real)
         _mk_symlink("whisper_hf_resolved", wh_real)
-        _fix_generation_config(wh_real)
         print(f"[bootstrap] Whisper HF resolved → {wh_real}")
 
     print("[bootstrap] Done.")
