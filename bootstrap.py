@@ -1,4 +1,9 @@
-import os, zipfile, shutil, tempfile, urllib.request, json
+import os
+import zipfile
+import shutil
+import tempfile
+import urllib.request
+import json
 from pathlib import Path
 
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/data/models"))
@@ -20,9 +25,6 @@ def fetch_and_unzip(url: str, target: Path):
     if have_any(target):
         print(f"[bootstrap] Exists: {target}")
         return
-    if not url:
-        print(f"[bootstrap] SKIP download for {target} (no URL provided)")
-        return
     print(f"[bootstrap] Downloading: {url}")
     with tempfile.TemporaryDirectory() as td:
         zpath = Path(td) / "bundle.zip"
@@ -33,7 +35,6 @@ def fetch_and_unzip(url: str, target: Path):
             z.extractall(target)
 
 def _resolve_orpheus_dir(base: Path) -> Path:
-    """Prefer acoustic model (config.json + tokenizer.json), avoid 'vocoder'."""
     if (base / "config.json").exists() and (base / "tokenizer.json").exists():
         return base
     best, best_score = None, -1
@@ -52,7 +53,6 @@ def _resolve_orpheus_dir(base: Path) -> Path:
     return matches[0].parent if matches else base
 
 def _resolve_whisper_hf_dir(base: Path) -> Path | None:
-    """Resolve HF Whisper folder (config.json + tokenizer/processor)."""
     if (base / "config.json").exists() and (
         (base / "tokenizer.json").exists()
         or (base / "tokenizer_config.json").exists()
@@ -85,8 +85,11 @@ def _env_path(name: str, default_subdir: str) -> Path:
     print(f"[bootstrap] {name} = {p}")
     return p
 
-def _patch_generation_config(root: Path):
-    """Set early_stopping=false if null/missing to avoid Transformers validation error."""
+def _fix_generation_config(root: Path):
+    """
+    Whisper safety: if generation_config.json exists and has early_stopping=null,
+    set it to false (or back up and remove the file).
+    """
     gc = root / "generation_config.json"
     if not gc.exists():
         return
@@ -94,10 +97,16 @@ def _patch_generation_config(root: Path):
         data = json.loads(gc.read_text())
         if data.get("early_stopping", None) is None:
             data["early_stopping"] = False
-            gc.write_text(json.dumps(data, indent=2))
-            print(f"[bootstrap] patched early_stopping=false in {gc}")
+            gc.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            print("[bootstrap] patched Whisper generation_config.json (early_stopping=false).")
     except Exception as e:
-        print(f"[bootstrap] WARN: cannot patch {gc}: {e}")
+        # worst case: remove the file so Transformers builds defaults
+        try:
+            bak = gc.with_suffix(".json.bak")
+            gc.rename(bak)
+            print(f"[bootstrap] WARN: could not parse/persist generation_config; moved to {bak}: {e}")
+        except Exception as e2:
+            print(f"[bootstrap] WARN: failed to remove problematic generation_config.json: {e2}")
 
 def main():
     _guard_hf_transfer()
@@ -107,34 +116,32 @@ def main():
     m2m_url     = os.environ.get("BUNDLE_M2M_URL", "")
     orpheus_url = os.environ.get("BUNDLE_ORPHEUS_URL", "")
 
-    # Resolve target directories
     path_qwen    = _env_path("PATH_QWEN",    "qwen2_5_instruct_7b")
     path_whisper = _env_path("PATH_WHISPER", "whisper_hf")
     path_m2m     = _env_path("PATH_M2M",     "m2m100_1p2B")
     path_orpheus = _env_path("PATH_ORPHEUS", "orpheus_3b")
 
-    # Unzip bundles (idempotent)
-    fetch_and_unzip(qwen_url,    path_qwen)
-    fetch_and_unzip(whisper_url, path_whisper)
-    fetch_and_unzip(m2m_url,     path_m2m)
-    fetch_and_unzip(orpheus_url, path_orpheus)
+    if qwen_url:    fetch_and_unzip(qwen_url,    path_qwen)
+    if whisper_url: fetch_and_unzip(whisper_url, path_whisper)
+    if m2m_url:     fetch_and_unzip(m2m_url,     path_m2m)
+    if orpheus_url: fetch_and_unzip(orpheus_url, path_orpheus)
 
-    # Resolve & link
+    # Orpheus resolve + link
     orp_real = _resolve_orpheus_dir(path_orpheus)
     _mk_symlink("orpheus_3b_resolved", orp_real)
-    print(f"[bootstrap] Orpheus resolved → {orp_real}")
+    if (orp_real / "config.json").exists():
+        print(f"[bootstrap] Orpheus resolved → {orp_real}")
+    else:
+        print(f"[bootstrap] WARN: Orpheus config.json not found under {orp_real}")
 
+    # Whisper resolve + link + **sanitize gen config**
     wh_real = _resolve_whisper_hf_dir(path_whisper)
     if wh_real is None:
         print(f"[bootstrap] ERROR: could not resolve HF Whisper under {path_whisper}")
     else:
         _mk_symlink("whisper_hf_resolved", wh_real)
+        _fix_generation_config(wh_real)
         print(f"[bootstrap] Whisper HF resolved → {wh_real}")
-
-    # Patch generation_config.json where present
-    for root in [path_qwen, wh_real or Path(), path_m2m, orp_real]:
-        if root and root.exists():
-            _patch_generation_config(root)
 
     print("[bootstrap] Done.")
 
