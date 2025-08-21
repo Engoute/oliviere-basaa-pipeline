@@ -21,25 +21,42 @@ class QwenAgent:
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
             trust_remote_code=True,
+            local_files_only=True,
         ).eval()
+
+        # Guard for generation_config (same issue as Whisper)
+        try:
+            gen = self.model.generation_config
+            if getattr(gen, "early_stopping", None) is None:
+                gen.early_stopping = False
+        except Exception:
+            pass
 
     def chat_fr(self, user_text_fr: str, temperature: float = 0.3) -> str:
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_text_fr},
+            {"role": "system", "content": _SYSTEM_PROMPT.strip()},
+            {"role": "user", "content": user_text_fr.strip()},
         ]
-        inputs = self.tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(self.model.device)
+        inputs = self.tok.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        ).to(self.model.device)
+
         out = self.model.generate(
             input_ids=inputs,
             max_new_tokens=384,
             do_sample=temperature > 0.0,
-            temperature=temperature if temperature > 0.0 else None,
-            top_p=0.9 if temperature > 0.0 else None,
+            temperature=temperature if temperature > 0 else None,
+            top_p=0.9 if temperature > 0 else None,
             eos_token_id=self.tok.eos_token_id,
             pad_token_id=self.tok.eos_token_id,
         )
-        text = self.tok.decode(out[0], skip_special_tokens=True)
-        # Extract only the assistant part
-        if "assistant" in text:
-            text = text.split("assistant")[-1]
+
+        full = self.tok.decode(out[0], skip_special_tokens=False)
+        # Try to slice out only the final assistant message
+        try:
+            split = full.rsplit("<|assistant|>", 1)
+            text = split[-1]
+        except Exception:
+            text = self.tok.decode(out[0], skip_special_tokens=True)
+
         return text.strip()
