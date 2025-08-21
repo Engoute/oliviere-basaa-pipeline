@@ -1,4 +1,3 @@
-# /workspace/app/main.py
 import asyncio, json, traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -85,7 +84,7 @@ async def ws_translate(ws: WebSocket):
 
     await ws.close()
 
-# 2) AUDIO CHAT WITH QWEN (audio → Qwen EN/FR → Basaa + WAV)
+# 2) AUDIO CHAT WITH QWEN (audio → Qwen FR → Basaa + WAV)
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(ws: WebSocket):
     await ws.accept()
