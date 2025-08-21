@@ -38,30 +38,48 @@ def fetch_and_unzip(url: str, target: Path):
             z.extractall(target)
 
 
-def _resolve_model_dir(base: Path) -> Path:
-    """
-    Prefer a directory that contains BOTH config.json and tokenizer.json (acoustic model),
-    avoid folders named 'vocoder'. Fallback to the first config.json found.
-    """
+def _resolve_orpheus_dir(base: Path) -> Path:
+    """Prefer acoustic model (config.json + tokenizer.json), avoid 'vocoder'."""
     if (base / "config.json").exists() and (base / "tokenizer.json").exists():
         return base
-
-    candidates = []
+    best, best_score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
         if d.name.lower() == "vocoder":
             continue
         has_tok = (d / "tokenizer.json").exists()
         has_model = (d / "model.safetensors").exists() or any(d.glob("model-*.safetensors"))
-        score = (2 if has_tok else 0) + (1 if has_model else 0)  # prefer both present
-        candidates.append((score, d))
-
-    if candidates:
-        candidates.sort(key=lambda x: (-x[0], len(str(x[1]))))  # best score, then shortest path
-        return candidates[0][1]
-
+        score = (2 if has_tok else 0) + (1 if has_model else 0)
+        if score > best_score:
+            best, best_score = d, score
+    if best is not None:
+        return best
     matches = list(base.rglob("config.json"))
     return matches[0].parent if matches else base
+
+
+def _resolve_whisper_hf_dir(base: Path) -> Path | None:
+    """
+    Resolve an HF Whisper folder: needs config.json and either tokenizer.json/tokenizer_config.json
+    or a 'processor' subfolder. Works with nested layouts.
+    """
+    # root direct?
+    if (base / "config.json").exists() and (
+        (base / "tokenizer.json").exists()
+        or (base / "tokenizer_config.json").exists()
+        or (base / "processor").exists()
+    ):
+        return base
+
+    best, best_score = None, -1
+    for cfg in base.rglob("config.json"):
+        d = cfg.parent
+        has_tok = (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists()
+        has_proc = (d / "processor").exists()
+        score = (2 if has_tok else 0) + (1 if has_proc else 0)
+        if score > best_score:
+            best, best_score = d, score
+    return best
 
 
 def _mk_symlink(name: str, target_dir: Path):
@@ -70,6 +88,7 @@ def _mk_symlink(name: str, target_dir: Path):
         if link.exists() or link.is_symlink():
             link.unlink()
         link.symlink_to(target_dir, target_is_directory=True)
+        print(f"[bootstrap] symlink {name} -> {target_dir}")
     except Exception as e:
         print(f"[bootstrap] WARN: could not create symlink {link} -> {target_dir}: {e}")
 
@@ -77,26 +96,34 @@ def _mk_symlink(name: str, target_dir: Path):
 def main():
     _guard_hf_transfer()
 
-    qwen_url = os.environ["BUNDLE_QWEN_URL"]
+    qwen_url    = os.environ["BUNDLE_QWEN_URL"]
     whisper_url = os.environ["BUNDLE_WHISPER_URL"]
-    m2m_url = os.environ["BUNDLE_M2M_URL"]
+    m2m_url     = os.environ["BUNDLE_M2M_URL"]
     orpheus_url = os.environ["BUNDLE_ORPHEUS_URL"]
 
     # unzip bundles (idempotent)
-    fetch_and_unzip(qwen_url, Path(os.environ["PATH_QWEN"]))
-    fetch_and_unzip(whisper_url, Path(os.environ["PATH_WHISPER_CT2"]))
-    fetch_and_unzip(m2m_url, Path(os.environ["PATH_M2M"]))
+    fetch_and_unzip(qwen_url,    Path(os.environ["PATH_QWEN"]))
+    fetch_and_unzip(whisper_url, Path(os.environ["PATH_WHISPER"]))
+    fetch_and_unzip(m2m_url,     Path(os.environ["PATH_M2M"]))
     fetch_and_unzip(orpheus_url, Path(os.environ["PATH_ORPHEUS"]))
 
-    # Orpheus: resolve to the acoustic model folder and expose a stable link
+    # Orpheus: resolve & link
     orp_base = Path(os.environ["PATH_ORPHEUS"])
-    orp_real = _resolve_model_dir(orp_base)
+    orp_real = _resolve_orpheus_dir(orp_base)
     _mk_symlink("orpheus_3b_resolved", orp_real)
-
     if not (orp_real / "config.json").exists():
         print(f"[bootstrap] WARN: Orpheus config.json not found under {orp_real}")
     else:
         print(f"[bootstrap] Orpheus resolved → {orp_real}")
+
+    # Whisper HF: resolve & link
+    wh_base = Path(os.environ["PATH_WHISPER"])
+    wh_real = _resolve_whisper_hf_dir(wh_base)
+    if wh_real is None:
+        print(f"[bootstrap] ERROR: could not resolve HF Whisper under {wh_base}")
+    else:
+        _mk_symlink("whisper_hf_resolved", wh_real)
+        print(f"[bootstrap] Whisper HF resolved → {wh_real}")
 
     print("[bootstrap] Done.")
 
