@@ -1,4 +1,3 @@
-# /workspace/bootstrap.py
 import os
 import zipfile
 import shutil
@@ -63,14 +62,12 @@ def _resolve_whisper_hf_dir(base: Path) -> Path | None:
     Resolve an HF Whisper folder: needs config.json and either tokenizer.json/tokenizer_config.json
     or a 'processor' subfolder. Works with nested layouts.
     """
-    # root direct?
     if (base / "config.json").exists() and (
         (base / "tokenizer.json").exists()
         or (base / "tokenizer_config.json").exists()
         or (base / "processor").exists()
     ):
         return base
-
     best, best_score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
@@ -93,23 +90,39 @@ def _mk_symlink(name: str, target_dir: Path):
         print(f"[bootstrap] WARN: could not create symlink {link} -> {target_dir}: {e}")
 
 
+def _env_path(name: str, default_subdir: str) -> Path:
+    """
+    Read an env var; if missing, fall back to /data/models/<default_subdir>.
+    Also print what we resolved so logs show exactly what paths are used.
+    """
+    val = os.environ.get(name, str(MODELS_DIR / default_subdir))
+    p = Path(val)
+    print(f"[bootstrap] {name} = {p}")
+    return p
+
+
 def main():
     _guard_hf_transfer()
 
-    qwen_url    = os.environ["BUNDLE_QWEN_URL"]
-    whisper_url = os.environ["BUNDLE_WHISPER_URL"]
-    m2m_url     = os.environ["BUNDLE_M2M_URL"]
-    orpheus_url = os.environ["BUNDLE_ORPHEUS_URL"]
+    qwen_url    = os.environ.get("BUNDLE_QWEN_URL", "")
+    whisper_url = os.environ.get("BUNDLE_WHISPER_URL", "")
+    m2m_url     = os.environ.get("BUNDLE_M2M_URL", "")
+    orpheus_url = os.environ.get("BUNDLE_ORPHEUS_URL", "")
 
-    # unzip bundles (idempotent)
-    fetch_and_unzip(qwen_url,    Path(os.environ["PATH_QWEN"]))
-    fetch_and_unzip(whisper_url, Path(os.environ["PATH_WHISPER"]))
-    fetch_and_unzip(m2m_url,     Path(os.environ["PATH_M2M"]))
-    fetch_and_unzip(orpheus_url, Path(os.environ["PATH_ORPHEUS"]))
+    # Resolve target directories (safe defaults if envs are missing)
+    path_qwen    = _env_path("PATH_QWEN",    "qwen2_5_instruct_7b")
+    path_whisper = _env_path("PATH_WHISPER", "whisper_hf")
+    path_m2m     = _env_path("PATH_M2M",     "m2m100_1p2B")
+    path_orpheus = _env_path("PATH_ORPHEUS", "orpheus_3b")
+
+    # Unzip bundles (idempotent)
+    if qwen_url:    fetch_and_unzip(qwen_url,    path_qwen)
+    if whisper_url: fetch_and_unzip(whisper_url, path_whisper)
+    if m2m_url:     fetch_and_unzip(m2m_url,     path_m2m)
+    if orpheus_url: fetch_and_unzip(orpheus_url, path_orpheus)
 
     # Orpheus: resolve & link
-    orp_base = Path(os.environ["PATH_ORPHEUS"])
-    orp_real = _resolve_orpheus_dir(orp_base)
+    orp_real = _resolve_orpheus_dir(path_orpheus)
     _mk_symlink("orpheus_3b_resolved", orp_real)
     if not (orp_real / "config.json").exists():
         print(f"[bootstrap] WARN: Orpheus config.json not found under {orp_real}")
@@ -117,10 +130,9 @@ def main():
         print(f"[bootstrap] Orpheus resolved → {orp_real}")
 
     # Whisper HF: resolve & link
-    wh_base = Path(os.environ["PATH_WHISPER"])
-    wh_real = _resolve_whisper_hf_dir(wh_base)
+    wh_real = _resolve_whisper_hf_dir(path_whisper)
     if wh_real is None:
-        print(f"[bootstrap] ERROR: could not resolve HF Whisper under {wh_base}")
+        print(f"[bootstrap] ERROR: could not resolve HF Whisper under {path_whisper}")
     else:
         _mk_symlink("whisper_hf_resolved", wh_real)
         print(f"[bootstrap] Whisper HF resolved → {wh_real}")
