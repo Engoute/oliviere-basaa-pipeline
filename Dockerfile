@@ -1,4 +1,3 @@
-# /workspace/Dockerfile
 # Single image, H200-ready, CUDA 12.8, PyTorch 2.8
 FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
