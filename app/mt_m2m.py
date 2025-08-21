@@ -1,50 +1,88 @@
+# FILE: app/mt_m2m.py
+from __future__ import annotations
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from .config import S
 
-# We stick to HF Transformers here (H200 is plenty fast)
+# Simple HF-only wrapper around fine-tuned M2M-100 1.2B.
+# Interface:
+#   to_fr(text, src_code)
+#   to_lg(text, src_code)
+
+_LANG_FALLBACK = {
+    "fra": "fr", "eng": "en", "fr-FR": "fr", "en-US": "en", "fr": "fr", "en": "en", "lg": "lg"
+}
+
 class M2M:
     def __init__(self, path: str):
-        self.tok = AutoTokenizer.from_pretrained(path, local_files_only=True)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
+
+        self.tok = AutoTokenizer.from_pretrained(path, local_files_only=True, use_fast=False)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(
-            path, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-        ).to("cuda" if torch.cuda.is_available() else "cpu").eval()
-        # Basaa tag
-        self.basaa_code = "lg"  # as you specified
-
-    def _generate(self, text: str, src_lang: str, tgt_lang: str) -> str:
-        tok = self.tok
-        inputs = tok(text, return_tensors="pt").to(self.model.device)
-        # set language tokens as M2M requires
-        forced_bos_token_id = tok.get_lang_id(tgt_lang)
-        out = self.model.generate(
-            **inputs,
-            forced_bos_token_id=forced_bos_token_id,
-            max_new_tokens=256,
-            num_beams=4,
-            do_sample=False,
+            path,
+            local_files_only=True,
+            torch_dtype=self.dtype,
+            low_cpu_mem_usage=True,
+            device_map="auto" if self.device == "cuda" else None
         )
-        return tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+        if self.device == "cuda" and getattr(self.model, "device", None) is None:
+            self.model.to(self.device)
+        self.model.eval()
 
-    def to_fr(self, text: str, src_lang: str) -> str:
-        # src could be lg or en/fr/other; if already fr, just return
-        if src_lang == "fr": return text
-        if src_lang == self.basaa_code:
-            return self._generate(text, src_lang, "fr")
-        elif src_lang == "en":
-            return self._generate(text, "en", "fr")
-        else:
-            # unknown → try direct to fr
-            return self._generate(text, src_lang, "fr")
+        # Pre-cache language ids if available (M2M-100 exposes get_lang_id)
+        self._lang_to_id = {}
+        for code in ["fr", "en", "lg"]:
+            try:
+                self._lang_to_id[code] = self.tok.get_lang_id(code)  # type: ignore[attr-defined]
+            except Exception:
+                self._lang_to_id[code] = None
 
-    def to_lg(self, text: str, src_lang: str) -> str:
-        if src_lang == self.basaa_code: return text
-        # Prefer FR→LG; English first passes through FR if needed
-        if src_lang == "fr":
-            return self._generate(text, "fr", self.basaa_code)
-        elif src_lang == "en":
-            fr = self._generate(text, "en", "fr")
-            return self._generate(fr, "fr", self.basaa_code)
-        else:
-            # Fallback: try target lg directly
-            return self._generate(text, src_lang, self.basaa_code)
+        print("[m2m] Loaded M2M-100 model (HF). Lang IDs:", self._lang_to_id)
+
+    def _norm(self, code: str) -> str:
+        return _LANG_FALLBACK.get(code, code)
+
+    def _translate(self, text: str, src_code: str, tgt_code: str) -> str:
+        if not text:
+            return ""
+
+        src = self._norm(src_code)
+        tgt = self._norm(tgt_code)
+
+        # M2M-100 expects tokenizer.src_lang and forced_bos_token_id for target
+        try:
+            self.tok.src_lang = src  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        forced_bos = None
+        try:
+            forced_bos = self.tok.get_lang_id(tgt)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        inputs = self.tok(text, return_tensors="pt", truncation=True, max_length=512).to(self.model.device)
+        gen_kwargs = dict(
+            max_new_tokens=256,
+            num_beams=1,
+            do_sample=False,
+            early_stopping=True,
+        )
+        if forced_bos is not None:
+            gen_kwargs["forced_bos_token_id"] = forced_bos
+
+        with torch.inference_mode():
+            out = self.model.generate(**inputs, **gen_kwargs)
+        return self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+
+    def to_fr(self, text: str, src_code: str) -> str:
+        src = self._norm(src_code)
+        if src == "fr":
+            return text
+        return self._translate(text, src, "fr")
+
+    def to_lg(self, text: str, src_code: str) -> str:
+        src = self._norm(src_code)
+        if src == "lg":
+            return text
+        return self._translate(text, src, "lg")
