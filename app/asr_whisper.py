@@ -2,13 +2,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Optional CT2 backend (ignored unless a CT2 bundle with model.bin exists)
+# Optional CT2 (ignored unless model.bin exists)
 try:
     from faster_whisper import WhisperModel as CT2WhisperModel  # type: ignore
 except Exception:
     CT2WhisperModel = None
 
-# Try native Whisper classes; fall back to auto-classes + manual glue
+# Prefer native Whisper classes; fall back to auto-classes
 try:
     from transformers import (
         WhisperForConditionalGeneration,
@@ -29,8 +29,7 @@ except Exception:
     WhisperProcessor = None  # type: ignore
     _WHISPER_NATIVE = False
 
-BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize any of these → "lg"
-
+BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize → "lg"
 
 def _is_hf_dir(d: Path) -> bool:
     return (d / "config.json").exists() and (
@@ -38,7 +37,6 @@ def _is_hf_dir(d: Path) -> bool:
         or (d / "tokenizer_config.json").exists()
         or (d / "processor").exists()
     )
-
 
 def _resolve_hf_dir(base: Path) -> Path | None:
     if _is_hf_dir(base):
@@ -52,15 +50,13 @@ def _resolve_hf_dir(base: Path) -> Path | None:
             best, best_score = d, score
     return best
 
-
 class ASR:
     def __init__(self, base_path: str):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        # Prefer the HF symlink created by bootstrap
-        candidates: list[Path] = [Path("/data/models/whisper_hf_resolved")]
-        # Then the env/config path passed in
+        # Prefer symlink from bootstrap, then explicit path
+        candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
             candidates.append(Path(base_path))
 
@@ -76,22 +72,17 @@ class ASR:
                     use_hf = d
                     break
 
-        # HF is the design target
         if use_hf is not None:
-            # Processor (native or manual)
+            # Processor (native or manual glue)
             if _WHISPER_NATIVE and WhisperProcessor is not None:
                 try:
                     self.proc = WhisperProcessor.from_pretrained(
                         str(use_hf), subfolder="processor", local_files_only=True
                     )
-                    self.tok = self.proc.tokenizer
-                    self.feat = self.proc.feature_extractor
                 except Exception:
-                    self.proc = WhisperProcessor.from_pretrained(
-                        str(use_hf), local_files_only=True
-                    )
-                    self.tok = self.proc.tokenizer
-                    self.feat = self.proc.feature_extractor
+                    self.proc = WhisperProcessor.from_pretrained(str(use_hf), local_files_only=True)
+                self.tok = self.proc.tokenizer
+                self.feat = self.proc.feature_extractor
             else:
                 self.tok = WhisperTokenizer.from_pretrained(str(use_hf), local_files_only=True)
                 try:
@@ -106,6 +97,14 @@ class ASR:
             self.hf = WhisperForConditionalGeneration.from_pretrained(
                 str(use_hf), local_files_only=True, torch_dtype=self.dtype, low_cpu_mem_usage=True
             ).to(self.device).eval()
+
+            # Guard: generation_config.early_stopping must not be None
+            try:
+                gen = self.hf.generation_config
+                if getattr(gen, "early_stopping", None) is None:
+                    gen.early_stopping = False
+            except Exception:
+                pass
 
             # Build language-token map
             self.lang_to_id = {}
@@ -122,7 +121,6 @@ class ASR:
             print(f"[asr] using HF Whisper at: {use_hf}")
             return
 
-        # Optional CT2 fallback (only if you later add a CT2 bundle)
         if use_ct2 is not None and CT2WhisperModel is not None:
             self.ct2 = CT2WhisperModel(str(use_ct2), device="cuda", compute_type="float16")
             self.backend = "ct2"
@@ -164,7 +162,6 @@ class ASR:
             return None
 
     def transcribe(self, wav16k: bytes):
-        # HF path
         pcm = self._pcm16_to_float(wav16k)
         feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
                  .input_features.to(self.device).to(self.hf.dtype))
@@ -180,8 +177,4 @@ class ASR:
         with torch.inference_mode():
             out = self.hf.generate(
                 feats, do_sample=False, num_beams=1, max_new_tokens=safe_new,
-                pad_token_id=self.tok.eos_token_id, eos_token_id=self.tok.eos_token_id,
-            )
-        text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
-        code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
-        return text, code, conf
+                pad_token_id=self.tok.eos_token_id, eos_token_id
