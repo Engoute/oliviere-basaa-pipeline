@@ -1,3 +1,4 @@
+# /workspace/bootstrap.py
 import os
 import zipfile
 import shutil
@@ -109,7 +110,7 @@ def _patch_generation_config_file(gc_path: Path):
         changed = False
 
         # Fix invalid early_stopping
-        if cfg.get("early_stopping", None) is None or cfg.get("early_stopping") not in (True, False, "never"):
+        if cfg.get("early_stopping", None) not in (True, False, "never"):
             cfg["early_stopping"] = "never"
             changed = True
 
@@ -174,4 +175,11 @@ def main():
         print(f"[bootstrap] Whisper HF resolved → {wh_real}")
 
     # --- GLOBAL PATCH: sanitize gen configs everywhere ---
-    for root in {path_qwen, path_whisper,
+    for root in [path_qwen, path_whisper, path_m2m, orp_real, MODELS_DIR]:
+        _patch_generation_config_tree(root)
+
+    print("[bootstrap] Done.")
+
+
+if __name__ == "__main__":
+    main()
