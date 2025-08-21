@@ -1,152 +1,171 @@
-import os, zipfile, shutil, tempfile, urllib.request, json
+# app/asr_whisper.py
+from __future__ import annotations
+
+import numpy as np
 from pathlib import Path
-from typing import Optional
+import torch
 
-MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/data/models"))
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+# Prefer native Whisper classes; fall back to auto-classes if needed
+try:
+    from transformers import (
+        WhisperForConditionalGeneration,
+        WhisperProcessor,
+        WhisperTokenizer,
+        WhisperFeatureExtractor,
+    )
+    _NATIVE = True
+except Exception:
+    from transformers import (
+        AutoModelForSpeechSeq2Seq as WhisperForConditionalGeneration,
+        AutoTokenizer as WhisperTokenizer,
+        AutoFeatureExtractor as WhisperFeatureExtractor,
+    )
+    WhisperProcessor = None  # type: ignore
+    _NATIVE = False
 
+__all__ = ["ASR"]   # ← guarantees `from .asr_whisper import ASR` finds it
 
-def _guard_hf_transfer():
-    if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
-        try:
-            import hf_transfer  # noqa: F401
-        except Exception:
-            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-            print("[bootstrap] hf_transfer missing; disabling acceleration.")
+BASAA_ALIASES = {"lg", "bas", "basaa"}  # normalize → "lg"
 
+def _is_hf_dir(d: Path) -> bool:
+    return (d / "config.json").exists() and (
+        (d / "tokenizer.json").exists()
+        or (d / "tokenizer_config.json").exists()
+        or (d / "processor").exists()
+    )
 
-def have_any(p: Path) -> bool:
-    return p.exists() and any(p.rglob("*"))
-
-
-def fetch_and_unzip(url: str, target: Path):
-    target.mkdir(parents=True, exist_ok=True)
-    if have_any(target):
-        print(f"[bootstrap] Exists: {target}")
-        return
-    print(f"[bootstrap] Downloading: {url}")
-    with tempfile.TemporaryDirectory() as td:
-        zpath = Path(td) / "bundle.zip"
-        with urllib.request.urlopen(url) as r, open(zpath, "wb") as f:
-            shutil.copyfileobj(r, f)
-        print(f"[bootstrap] Unzipping to {target}")
-        with zipfile.ZipFile(zpath, "r") as z:
-            z.extractall(target)
-
-
-def _resolve_orpheus_dir(base: Path) -> Path:
-    """Prefer acoustic model (config.json + tokenizer.json), avoid 'vocoder'."""
-    if (base / "config.json").exists() and (base / "tokenizer.json").exists():
+def _resolve_hf_dir(base: Path) -> Path | None:
+    if _is_hf_dir(base):
         return base
     best, best_score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
-        if d.name.lower() == "vocoder":
-            continue
-        has_tok = (d / "tokenizer.json").exists()
-        has_model = (d / "model.safetensors").exists() or any(d.glob("model-*.safetensors"))
-        score = (2 if has_tok else 0) + (1 if has_model else 0)
-        if score > best_score:
-            best, best_score = d, score
-    if best is not None:
-        return best
-    matches = list(base.rglob("config.json"))
-    return matches[0].parent if matches else base
-
-
-def _resolve_whisper_hf_dir(base: Path) -> Optional[Path]:
-    """Resolve an HF Whisper folder (config.json + tokenizer/processor)."""
-    if (base / "config.json").exists() and (
-        (base / "tokenizer.json").exists()
-        or (base / "tokenizer_config.json").exists()
-        or (base / "processor").exists()
-    ):
-        return base
-    best, best_score = None, -1
-    for cfg in base.rglob("config.json"):
-        d = cfg.parent
-        has_tok = (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists()
-        has_proc = (d / "processor").exists()
-        score = (2 if has_tok else 0) + (1 if has_proc else 0)
+        score = (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
+                + (1 if (d / "processor").exists() else 0)
         if score > best_score:
             best, best_score = d, score
     return best
 
+class ASR:
+    """
+    HF Whisper (merged LoRA). Expects a directory with:
+      - config.json, model-*.safetensors, model.safetensors.index.json
+      - processor/ (tokenizer + feature extractor)
+    bootstrap.py creates /data/models/whisper_hf_resolved -> the real folder.
+    """
+    def __init__(self, base_path: str | None):
+        print("[asr] importing app.asr_whisper…")  # visible on module import
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
-def _mk_symlink(name: str, target_dir: Path):
-    link = MODELS_DIR / name
-    try:
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(target_dir, target_is_directory=True)
-        print(f"[bootstrap] symlink {name} -> {target_dir}")
-    except Exception as e:
-        print(f"[bootstrap] WARN: could not create symlink {link} -> {target_dir}: {e}")
+        # Prefer the stable symlink created by bootstrap
+        candidates: list[Path] = [Path("/data/models/whisper_hf_resolved")]
+        if base_path:
+            candidates.append(Path(base_path))
 
+        use = None
+        for c in candidates:
+            if c.exists():
+                d = _resolve_hf_dir(c)
+                if d is not None:
+                    use = d
+                    break
+        if use is None:
+            raise RuntimeError(f"HF Whisper not found under {candidates}")
 
-def _env_path(name: str, default_subdir: str) -> Path:
-    val = os.environ.get(name, str(MODELS_DIR / default_subdir))
-    p = Path(val)
-    print(f"[bootstrap] {name} = {p}")
-    return p
+        # Processor (native or manual)
+        if _NATIVE and WhisperProcessor is not None:
+            # Try subfolder=processor first, else root
+            try:
+                self.proc = WhisperProcessor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
+            except Exception:
+                self.proc = WhisperProcessor.from_pretrained(str(use), local_files_only=True)
+            self.tok  = self.proc.tokenizer
+            self.feat = self.proc.feature_extractor
+        else:
+            self.tok = WhisperTokenizer.from_pretrained(str(use), local_files_only=True)
+            try:
+                self.feat = WhisperFeatureExtractor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
+            except Exception:
+                self.feat = WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
 
+        # Model
+        self.hf = WhisperForConditionalGeneration.from_pretrained(
+            str(use),
+            local_files_only=True,
+            torch_dtype=self.dtype,
+            low_cpu_mem_usage=True,
+        ).to(self.device).eval()
 
-def _nuke_generation_configs(root: Path):
-    """Unconditionally disable all generation_config.json files under root."""
-    found = 0
-    for gc in list(root.glob("generation_config.json")) + list(root.rglob("generation_config.json")):
+        # Language tokens
+        self.lang_to_id = {}
+        for code in (
+            "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
+            "is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa pl ps pt ro ru sa sd si sk sl sn so "
+            "sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo zh yue lg bas basaa"
+        ).split():
+            tid = self.tok.convert_tokens_to_ids(f"<|{code}|>")
+            if isinstance(tid, int) and tid >= 0:
+                self.lang_to_id[code] = tid
+
+        print(f"[asr] HF Whisper ready at: {use}")
+
+    @staticmethod
+    def _pcm16_to_float(wav16k: bytes) -> np.ndarray:
+        return (np.frombuffer(wav16k, dtype=np.int16).astype(np.float32) / 32768.0)
+
+    def _detect_lang(self, feats):
+        if not self.lang_to_id:
+            return "unk", 0.0
+        sot  = self.tok.convert_tokens_to_ids("<|startoftranscript|>")
+        nots = self.tok.convert_tokens_to_ids("<|notimestamps|>")
+        dec  = torch.tensor([[sot, nots]], device=self.device, dtype=torch.long)
+        with torch.inference_mode():
+            out   = self.hf(input_features=feats, decoder_input_ids=dec)
+            probs = torch.softmax(out.logits[:, -1, :], dim=-1)[0]
+        code, tid = max(self.lang_to_id.items(), key=lambda kv: float(probs[kv[1]].item()))
+        return code, float(probs[tid].item())
+
+    def transcribe(self, wav16k: bytes):
+        pcm = self._pcm16_to_float(wav16k)
+        feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
+                 .input_features.to(self.device).to(self.hf.dtype))
+
+        code, conf = self._detect_lang(feats)
+
+        # Build forced ids manually (don’t trust generation_config)
+        def _forced_ids(lang_code: str | None):
+            ids, pos = [], 0
+            for tok in [
+                "<|startoftranscript|>",
+                (f"<|{lang_code}|>" if (lang_code and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>") != self.tok.unk_token_id) else None),
+                "<|transcribe|>", "<|notimestamps|>",
+            ]:
+                if tok is None: continue
+                tid = self.tok.convert_tokens_to_ids(tok)
+                if isinstance(tid, int) and tid >= 0:
+                    ids.append((pos, tid)); pos += 1
+            return ids or None
+
+        forced = _forced_ids(code if code != "unk" else None)
         try:
-            newp = gc.with_suffix(gc.suffix + ".disabled")
-            gc.rename(newp)
-            print(f"[bootstrap] disabled {gc}")
-            found += 1
-        except Exception as e:
-            print(f"[bootstrap] WARN: could not disable {gc}: {e}")
-    if found == 0:
-        print(f"[bootstrap] no generation_config.json under {root} (nothing to disable)")
+            self.hf.generation_config.forced_decoder_ids = forced
+        except Exception:
+            self.hf.generation_config.forced_decoder_ids = None
 
+        max_target = int(getattr(self.hf.config, "max_target_positions", 448) or 448)
+        forced_len = len(forced) if forced else 2
+        safe_new   = max(1, min(400, max_target - forced_len - 1))
 
-def main():
-    _guard_hf_transfer()
-
-    qwen_url    = os.environ.get("BUNDLE_QWEN_URL", "")
-    whisper_url = os.environ.get("BUNDLE_WHISPER_URL", "")
-    m2m_url     = os.environ.get("BUNDLE_M2M_URL", "")
-    orpheus_url = os.environ.get("BUNDLE_ORPHEUS_URL", "")
-
-    # Resolve target directories
-    path_qwen    = _env_path("PATH_QWEN",    "qwen2_5_instruct_7b")
-    path_whisper = _env_path("PATH_WHISPER", "whisper_hf")
-    path_m2m     = _env_path("PATH_M2M",     "m2m100_1p2B")
-    path_orpheus = _env_path("PATH_ORPHEUS", "orpheus_3b")
-
-    # Unzip bundles (idempotent)
-    if qwen_url:    fetch_and_unzip(qwen_url,    path_qwen)
-    if whisper_url: fetch_and_unzip(whisper_url, path_whisper)
-    if m2m_url:     fetch_and_unzip(m2m_url,     path_m2m)
-    if orpheus_url: fetch_and_unzip(orpheus_url, path_orpheus)
-
-    # Resolve & link convenience paths
-    orp_real = _resolve_orpheus_dir(path_orpheus)
-    _mk_symlink("orpheus_3b_resolved", orp_real)
-    if not (orp_real / "config.json").exists():
-        print(f"[bootstrap] WARN: Orpheus config.json not found under {orp_real}")
-    else:
-        print(f"[bootstrap] Orpheus resolved → {orp_real}")
-
-    wh_real = _resolve_whisper_hf_dir(path_whisper)
-    if wh_real is None:
-        print(f"[bootstrap] ERROR: could not resolve HF Whisper under {path_whisper}")
-    else:
-        _mk_symlink("whisper_hf_resolved", wh_real)
-        print(f"[bootstrap] Whisper HF resolved → {wh_real}")
-
-    # **Hard fix**: disable all generation_config.json files before any model loads
-    for root in [path_qwen, path_whisper, path_m2m, orp_real, MODELS_DIR]:
-        _nuke_generation_configs(root)
-
-    print("[bootstrap] Done.")
-
-
-if __name__ == "__main__":
-    main()
+        with torch.inference_mode():
+            out = self.hf.generate(
+                feats,
+                do_sample=False, num_beams=1,
+                max_new_tokens=safe_new,
+                pad_token_id=self.tok.eos_token_id,
+                eos_token_id=self.tok.eos_token_id,
+                early_stopping=True,       # avoid config None issues
+            )
+        text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+        code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
+        return text, code, conf
