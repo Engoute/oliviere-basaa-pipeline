@@ -1,3 +1,4 @@
+# /workspace/Dockerfile
 # Single image, H200-ready, CUDA 12.8, PyTorch 2.8
 FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
@@ -30,7 +31,7 @@ ENV HF_HOME=/data/cache/hf \
 ENV HOST=0.0.0.0 \
     PORT=7860
 
-# The following envs point to your HF dataset bundles (override at deploy if you rename)
+# HF dataset bundle URLs (override at deploy if you rename)
 ENV BUNDLE_QWEN_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/qwen2_5_instruct_7b_bundle_20250820_135722.zip"
 ENV BUNDLE_WHISPER_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/whisper_bundle_20250817_163830.zip"
 ENV BUNDLE_M2M_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/m2m100_bundle_20250817_155147.zip"
@@ -39,7 +40,8 @@ ENV BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/
 # Where bundles are unzipped
 ENV MODELS_DIR=/data/models
 ENV PATH_QWEN=$MODELS_DIR/qwen2_5_instruct_7b
-ENV PATH_WHISPER_CT2=$MODELS_DIR/whisper_ct2
+# HF Whisper path (NOT CT2)
+ENV PATH_WHISPER=$MODELS_DIR/whisper_hf
 ENV PATH_M2M=$MODELS_DIR/m2m100_1p2B
 ENV PATH_ORPHEUS=$MODELS_DIR/orpheus_3b
 
@@ -48,6 +50,5 @@ ENV PERSONA_NAME="Nkum Nyambe"
 ENV PERSONA_BUILDER="Le Mister I.A (Yannick Engoute)"
 ENV PERSONA_DECLINE_TECH="true"
 
-# First run: pull + unzip bundles into /data
-# (Idempotent; safe to run on every container start)
+# First run: pull + unzip bundles into /data (idempotent)
 CMD python bootstrap.py && python -m uvicorn app.main:app --host $HOST --port $PORT
