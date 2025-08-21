@@ -1,10 +1,4 @@
-# /workspace/bootstrap.py
-import os
-import zipfile
-import shutil
-import tempfile
-import urllib.request
-import json
+import os, zipfile, shutil, tempfile, urllib.request, json
 from pathlib import Path
 from typing import Optional
 
@@ -61,10 +55,7 @@ def _resolve_orpheus_dir(base: Path) -> Path:
 
 
 def _resolve_whisper_hf_dir(base: Path) -> Optional[Path]:
-    """
-    Resolve an HF Whisper folder: needs config.json and either tokenizer.json/tokenizer_config.json
-    or a 'processor' subfolder. Works with nested layouts.
-    """
+    """Resolve an HF Whisper folder (config.json + tokenizer/processor)."""
     if (base / "config.json").exists() and (
         (base / "tokenizer.json").exists()
         or (base / "tokenizer_config.json").exists()
@@ -94,48 +85,25 @@ def _mk_symlink(name: str, target_dir: Path):
 
 
 def _env_path(name: str, default_subdir: str) -> Path:
-    """
-    Read an env var; if missing, fall back to /data/models/<default_subdir>.
-    Also print what we resolved so logs show exactly what paths are used.
-    """
     val = os.environ.get(name, str(MODELS_DIR / default_subdir))
     p = Path(val)
     print(f"[bootstrap] {name} = {p}")
     return p
 
 
-def _patch_generation_config_file(gc_path: Path):
-    try:
-        cfg = json.loads(gc_path.read_text())
-        changed = False
-
-        # Fix invalid early_stopping
-        if cfg.get("early_stopping", None) not in (True, False, "never"):
-            cfg["early_stopping"] = "never"
-            changed = True
-
-        # Strip fragile forced tokens that can conflict with runtime
-        for k in ("forced_decoder_ids", "forced_bos_token_id", "forced_eos_token_id"):
-            if k in cfg:
-                cfg.pop(k, None)
-                changed = True
-
-        if changed:
-            gc_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-            print(f"[bootstrap] patched {gc_path}")
-    except Exception as e:
-        # If anything goes wrong, disable the file so Transformers uses defaults
-        try:
-            gc_path.rename(gc_path.with_suffix(gc_path.suffix + ".disabled"))
-            print(f"[bootstrap] renamed invalid {gc_path} → *.disabled ({e})")
-        except Exception as e2:
-            print(f"[bootstrap] WARN: could not patch or rename {gc_path}: {e2}")
-
-
-def _patch_generation_config_tree(root: Path):
-    # Patch generation_config.json in root and recursively under it
+def _nuke_generation_configs(root: Path):
+    """Unconditionally disable all generation_config.json files under root."""
+    found = 0
     for gc in list(root.glob("generation_config.json")) + list(root.rglob("generation_config.json")):
-        _patch_generation_config_file(gc)
+        try:
+            newp = gc.with_suffix(gc.suffix + ".disabled")
+            gc.rename(newp)
+            print(f"[bootstrap] disabled {gc}")
+            found += 1
+        except Exception as e:
+            print(f"[bootstrap] WARN: could not disable {gc}: {e}")
+    if found == 0:
+        print(f"[bootstrap] no generation_config.json under {root} (nothing to disable)")
 
 
 def main():
@@ -146,7 +114,7 @@ def main():
     m2m_url     = os.environ.get("BUNDLE_M2M_URL", "")
     orpheus_url = os.environ.get("BUNDLE_ORPHEUS_URL", "")
 
-    # Resolve target directories (safe defaults if envs are missing)
+    # Resolve target directories
     path_qwen    = _env_path("PATH_QWEN",    "qwen2_5_instruct_7b")
     path_whisper = _env_path("PATH_WHISPER", "whisper_hf")
     path_m2m     = _env_path("PATH_M2M",     "m2m100_1p2B")
@@ -158,7 +126,7 @@ def main():
     if m2m_url:     fetch_and_unzip(m2m_url,     path_m2m)
     if orpheus_url: fetch_and_unzip(orpheus_url, path_orpheus)
 
-    # Orpheus: resolve & link
+    # Resolve & link convenience paths
     orp_real = _resolve_orpheus_dir(path_orpheus)
     _mk_symlink("orpheus_3b_resolved", orp_real)
     if not (orp_real / "config.json").exists():
@@ -166,7 +134,6 @@ def main():
     else:
         print(f"[bootstrap] Orpheus resolved → {orp_real}")
 
-    # Whisper HF: resolve & link
     wh_real = _resolve_whisper_hf_dir(path_whisper)
     if wh_real is None:
         print(f"[bootstrap] ERROR: could not resolve HF Whisper under {path_whisper}")
@@ -174,9 +141,9 @@ def main():
         _mk_symlink("whisper_hf_resolved", wh_real)
         print(f"[bootstrap] Whisper HF resolved → {wh_real}")
 
-    # --- GLOBAL PATCH: sanitize gen configs everywhere ---
+    # **Hard fix**: disable all generation_config.json files before any model loads
     for root in [path_qwen, path_whisper, path_m2m, orp_real, MODELS_DIR]:
-        _patch_generation_config_tree(root)
+        _nuke_generation_configs(root)
 
     print("[bootstrap] Done.")
 
