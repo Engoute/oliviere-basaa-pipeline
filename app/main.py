@@ -5,11 +5,14 @@ from fastapi.responses import PlainTextResponse
 from .config import S
 from .asr_whisper import ASR
 from .mt_m2m import M2M
+from .tts_orpheus import Orpheus
+from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Whisper+M2M", version="0.2")
+app = FastAPI(title="Basaa Whisper+M2M+TTS", version="0.3")
 
 ASR_MODEL = ASR(S.path_whisper)
 MT        = M2M(S.path_m2m)
+TTS       = Orpheus(S.path_orpheus, sr_out=S.tts_sr)
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
@@ -73,14 +76,20 @@ async def ws_translate(ws: WebSocket):
     text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
 
     # Policy:
-    # - If input is Basaa (lg) -> output French
-    # - If input is FR/EN/other -> output Basaa
+    # - If input is Basaa (lg) -> output French (no TTS)
+    # - If input is FR/EN/other -> output Basaa + WAV@24k
+    wav_bytes = None
     if wlang == "lg":
         fr_text = MT.to_fr(text, "lg")
         lg_text = text
     else:
         fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
         lg_text = MT.to_lg(text, wlang)
+        wav = TTS.tts(lg_text)
+        if wav.size > 0:
+            wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
 
     await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
+    if wav_bytes:
+        await ws.send_bytes(wav_bytes)
     await ws.close()
