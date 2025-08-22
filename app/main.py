@@ -1,4 +1,7 @@
 # FILE: app/main.py
+from .fast import speed_tweaks
+speed_tweaks()
+
 import json, traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
