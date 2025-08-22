@@ -64,7 +64,7 @@ def _patch_config_json(root: Path):
         if isinstance(gcfg, dict):
             if gcfg.get("early_stopping", None) is None:
                 gcfg["early_stopping"] = True; changed = True
-            # drop other None keys to avoid validate() errors
+            # drop other None values to avoid validate() errors
             for k in list(gcfg.keys()):
                 if k != "early_stopping" and gcfg[k] is None:
                     del gcfg[k]; changed = True
@@ -93,6 +93,28 @@ def _resolve_whisper_hf_dir(base: Path) -> Optional[Path]:
             best, score = d, s
     return best
 
+def _resolve_orpheus_acoustic(base: Path) -> Optional[Path]:
+    # choose dir that has config.json + tokenizer.json + (model.safetensors or model-*.safetensors)
+    candidates = []
+    for cfg in base.rglob("config.json"):
+        d = cfg.parent
+        tok = (d / "tokenizer.json").exists()
+        wt  = (d / "model.safetensors").exists() or any(d.glob("model-*.safetensors"))
+        if tok and wt:
+            candidates.append(d)
+    if candidates:
+        # shortest path first (likely the main one)
+        candidates.sort(key=lambda p: len(str(p)))
+        return candidates[0]
+    # fallback: root
+    return base if (base / "tokenizer.json").exists() else None
+
+def _find_vocoder_dir(base: Path) -> Optional[Path]:
+    for d in base.rglob("vocoder"):
+        if (d / "config.json").exists() and (d / "pytorch_model.bin").exists():
+            return d
+    return None
+
 def _mk_symlink(name: str, target_dir: Path):
     link = MODELS_DIR / name
     try:
@@ -111,29 +133,50 @@ def main():
     m2m_url = os.environ.get("BUNDLE_M2M_URL", "")
     path_m2m = Path(os.environ.get("PATH_M2M", str(MODELS_DIR / "m2m100_1p2B")))
 
+    orpheus_url = os.environ.get("BUNDLE_ORPHEUS_URL", "")
+    path_orpheus = Path(os.environ.get("PATH_ORPHEUS", str(MODELS_DIR / "orpheus_3b")))
+
+    # Whisper
     print(f"[bootstrap] PATH_WHISPER = {path_whisper}")
     if whisper_url:
         _fetch_and_unzip(whisper_url, path_whisper)
-
     wh_real = _resolve_whisper_hf_dir(path_whisper) or path_whisper
     _mk_symlink("whisper_hf_resolved", wh_real)
     print(f"[bootstrap] Whisper HF resolved -> {wh_real}")
 
+    # M2M
     print(f"[bootstrap] PATH_M2M = {path_m2m}")
     if m2m_url:
         _fetch_and_unzip(m2m_url, path_m2m)
 
-    # Sanitize generation config problems (both files and embedded)
-    for root in [path_whisper, path_m2m, MODELS_DIR]:
+    # Orpheus
+    print(f"[bootstrap] PATH_ORPHEUS = {path_orpheus}")
+    if orpheus_url:
+        _fetch_and_unzip(orpheus_url, path_orpheus)
+    ac_dir = _resolve_orpheus_acoustic(path_orpheus)
+    if ac_dir:
+        _mk_symlink("orpheus_3b_resolved", ac_dir)
+        print(f"[bootstrap] Orpheus acoustic resolved -> {ac_dir}")
+    else:
+        print(f"[bootstrap] WARN: could not resolve Orpheus acoustic dir under {path_orpheus}")
+    voc_dir = _find_vocoder_dir(path_orpheus)
+    if voc_dir:
+        print(f"[bootstrap] Orpheus vocoder found -> {voc_dir}")
+    else:
+        print(f"[bootstrap] WARN: Orpheus vocoder not found under {path_orpheus}")
+
+    # Sanitize generation config problems (files + embedded)
+    for root in [path_whisper, path_m2m, path_orpheus, MODELS_DIR]:
         _disable_generation_configs(root)
     _patch_config_json(path_m2m)
+    if ac_dir:
+        _patch_config_json(ac_dir)
 
-    # sanity: verify M2M has weights + tokenizer (single-file safetensors supported)
+    # sanity for M2M
     m2m_has_weights = _has_any(path_m2m, ("pytorch_model.bin", "model.safetensors", "model-*.safetensors"))
     m2m_has_tok     = _has_any(path_m2m, ("tokenizer.json", "*sentencepiece*.model", "*spm.*", "sentencepiece.bpe.model"))
     if not (m2m_has_weights and m2m_has_tok):
-        print("[bootstrap] WARNING: M2M bundle may be incomplete. Found "
-              f"weights={m2m_has_weights}, tokenizer={m2m_has_tok}")
+        print("[bootstrap] WARNING: M2M bundle may be incomplete.")
 
     print("[bootstrap] Done.")
 
