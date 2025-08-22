@@ -45,16 +45,28 @@ def _resolve_hf_dir(base: Path) -> Path | None:
     return best
 
 def _try_load_tokenizer(use: Path):
-    # Try processor/ first, then root
-    errs = []
-    for sub in ("processor", None):
+    # Prefer SLOW tokenizer (use_fast=False) to bypass problematic tokenizer.json
+    attempts = [
+        dict(subfolder="processor", use_fast=False),
+        dict(subfolder=None,        use_fast=False),
+        dict(subfolder="processor", use_fast=True),
+        dict(subfolder=None,        use_fast=True),
+    ]
+    errors = []
+    for a in attempts:
         try:
-            if sub:
-                return WhisperTokenizer.from_pretrained(str(use), subfolder=sub, local_files_only=True)
-            return WhisperTokenizer.from_pretrained(str(use), local_files_only=True)
+            if a["subfolder"]:
+                tok = WhisperTokenizer.from_pretrained(
+                    str(use), subfolder=a["subfolder"], local_files_only=True, use_fast=a["use_fast"]
+                )
+            else:
+                tok = WhisperTokenizer.from_pretrained(
+                    str(use), local_files_only=True, use_fast=a["use_fast"]
+                )
+            return tok
         except Exception as e:
-            errs.append((sub, repr(e)))
-    raise RuntimeError(f"[asr] Could not load WhisperTokenizer from {use}. Tried processor/ then root. Errors: {errs}")
+            errors.append((a, repr(e)))
+    raise RuntimeError(f"[asr] WhisperTokenizer load failed at {use}. Attempts={attempts}. Errors={errors}")
 
 def _try_load_feature_extractor(use: Path):
     for sub in ("processor", None):
@@ -64,7 +76,7 @@ def _try_load_feature_extractor(use: Path):
             return WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
         except Exception:
             pass
-    raise RuntimeError(f"[asr] Could not load WhisperFeatureExtractor from {use} (processor/ or root).")
+    raise RuntimeError(f"[asr] WhisperFeatureExtractor not found under {use} (processor/ or root).")
 
 class ASR:
     def __init__(self, base_path: str | None):
@@ -72,7 +84,7 @@ class ASR:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
-        # Prefer resolved symlink first so we hit the actual bundle dir
+        # Prefer the resolved symlink first (created by bootstrap)
         candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
             candidates.append(Path(base_path))
@@ -86,26 +98,9 @@ class ASR:
         if use is None:
             raise RuntimeError(f"HF Whisper not found. Tried: {candidates}")
 
-        # Best path: use WhisperProcessor if available, but still try processor/ first
-        self.tok = None
-        self.feat = None
-        if _NATIVE and WhisperProcessor is not None:
-            try:
-                proc = WhisperProcessor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
-            except Exception:
-                try:
-                    proc = WhisperProcessor.from_pretrained(str(use), local_files_only=True)
-                except Exception:
-                    proc = None
-            if proc is not None:
-                self.proc = proc
-                self.tok  = self.proc.tokenizer
-                self.feat = self.proc.feature_extractor
-
-        if self.tok is None or self.feat is None:
-            # Fallback: manual components, explicitly try processor/ first
-            self.tok  = _try_load_tokenizer(use)
-            self.feat = _try_load_feature_extractor(use)
+        # Avoid relying on Processor (it tends to pick fast); go straight to explicit loads
+        self.tok  = _try_load_tokenizer(use)
+        self.feat = _try_load_feature_extractor(use)
 
         self.hf = WhisperForConditionalGeneration.from_pretrained(
             str(use),
@@ -114,7 +109,7 @@ class ASR:
             low_cpu_mem_usage=True,
         ).to(self.device).eval()
 
-        # Language token map
+        # Build language token -> id map (incl. lg/basaa aliases)
         self.lang_to_id = {}
         for code in (
             "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
