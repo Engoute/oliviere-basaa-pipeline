@@ -23,7 +23,7 @@ except Exception:
 
 __all__ = ["ASR"]
 
-BASAA_ALIASES = {"lg", "bas", "basaa"}  # treat unknowns/aliases as lg
+BASAA_ALIASES = {"lg", "bas", "basaa"}
 
 def _is_hf_dir(d: Path) -> bool:
     return (d / "config.json").exists() and (
@@ -44,15 +44,39 @@ def _resolve_hf_dir(base: Path) -> Path | None:
             best, score = d, s
     return best
 
+def _try_load_tokenizer(use: Path):
+    # Try processor/ first, then root
+    errs = []
+    for sub in ("processor", None):
+        try:
+            if sub:
+                return WhisperTokenizer.from_pretrained(str(use), subfolder=sub, local_files_only=True)
+            return WhisperTokenizer.from_pretrained(str(use), local_files_only=True)
+        except Exception as e:
+            errs.append((sub, repr(e)))
+    raise RuntimeError(f"[asr] Could not load WhisperTokenizer from {use}. Tried processor/ then root. Errors: {errs}")
+
+def _try_load_feature_extractor(use: Path):
+    for sub in ("processor", None):
+        try:
+            if sub:
+                return WhisperFeatureExtractor.from_pretrained(str(use), subfolder=sub, local_files_only=True)
+            return WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
+        except Exception:
+            pass
+    raise RuntimeError(f"[asr] Could not load WhisperFeatureExtractor from {use} (processor/ or root).")
+
 class ASR:
     def __init__(self, base_path: str | None):
         print("[asr] importing app.asr_whisper…")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
+        # Prefer resolved symlink first so we hit the actual bundle dir
         candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
-            candidates.insert(0, Path(base_path))
+            candidates.append(Path(base_path))
+
         use = None
         for c in candidates:
             if c.exists():
@@ -60,21 +84,28 @@ class ASR:
                 if d is not None:
                     use = d; break
         if use is None:
-            raise RuntimeError(f"HF Whisper not found under {candidates}")
+            raise RuntimeError(f"HF Whisper not found. Tried: {candidates}")
 
+        # Best path: use WhisperProcessor if available, but still try processor/ first
+        self.tok = None
+        self.feat = None
         if _NATIVE and WhisperProcessor is not None:
             try:
-                self.proc = WhisperProcessor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
+                proc = WhisperProcessor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
             except Exception:
-                self.proc = WhisperProcessor.from_pretrained(str(use), local_files_only=True)
-            self.tok  = self.proc.tokenizer
-            self.feat = self.proc.feature_extractor
-        else:
-            self.tok = WhisperTokenizer.from_pretrained(str(use), local_files_only=True)
-            try:
-                self.feat = WhisperFeatureExtractor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
-            except Exception:
-                self.feat = WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
+                try:
+                    proc = WhisperProcessor.from_pretrained(str(use), local_files_only=True)
+                except Exception:
+                    proc = None
+            if proc is not None:
+                self.proc = proc
+                self.tok  = self.proc.tokenizer
+                self.feat = self.proc.feature_extractor
+
+        if self.tok is None or self.feat is None:
+            # Fallback: manual components, explicitly try processor/ first
+            self.tok  = _try_load_tokenizer(use)
+            self.feat = _try_load_feature_extractor(use)
 
         self.hf = WhisperForConditionalGeneration.from_pretrained(
             str(use),
@@ -83,7 +114,7 @@ class ASR:
             low_cpu_mem_usage=True,
         ).to(self.device).eval()
 
-        # Build language token -> id map (incl. "lg")
+        # Language token map
         self.lang_to_id = {}
         for code in (
             "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
@@ -113,7 +144,6 @@ class ASR:
         return code, float(probs[tid].item())
 
     def transcribe(self, wav16k: bytes):
-        # expects PCM16 mono, 16kHz
         pcm = self._pcm16_to_float(wav16k)
         feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
                  .input_features.to(self.device).to(self.hf.dtype))
