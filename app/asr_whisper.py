@@ -13,7 +13,6 @@ try:
     )
     _NATIVE = True
 except Exception:
-    # Fallback generics if needed
     from transformers import (
         AutoModelForSpeechSeq2Seq as WhisperForConditionalGeneration,
         AutoTokenizer as WhisperTokenizer,
@@ -24,8 +23,7 @@ except Exception:
 
 __all__ = ["ASR"]
 
-# Treat unknown Basaa detections as "lg"
-BASAA_ALIASES = {"lg", "bas", "basaa"}
+BASAA_ALIASES = {"lg", "bas", "basaa"}  # treat unknowns/aliases as lg
 
 def _is_hf_dir(d: Path) -> bool:
     return (d / "config.json").exists() and (
@@ -85,7 +83,7 @@ class ASR:
             low_cpu_mem_usage=True,
         ).to(self.device).eval()
 
-        # Build language token -> id map (include "lg"/Basaa aliases)
+        # Build language token -> id map (incl. "lg")
         self.lang_to_id = {}
         for code in (
             "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
@@ -115,6 +113,7 @@ class ASR:
         return code, float(probs[tid].item())
 
     def transcribe(self, wav16k: bytes):
+        # expects PCM16 mono, 16kHz
         pcm = self._pcm16_to_float(wav16k)
         feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
                  .input_features.to(self.device).to(self.hf.dtype))
