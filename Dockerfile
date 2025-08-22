@@ -1,4 +1,3 @@
-# FILE: Dockerfile
 FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -17,15 +16,15 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY app/ ./app/
-COPY bootstrap.py README.md ./ 2>/dev/null || true
+COPY bootstrap.py ./bootstrap.py
+# (Optional) COPY README if you have it:
+# COPY README.md ./README.md
 
 ENV HF_HOME=/data/cache/hf \
-    TRANSFORMERS_CACHE=/data/cache/hf
-
-ENV HOST=0.0.0.0 \
+    TRANSFORMERS_CACHE=/data/cache/hf \
+    HOST=0.0.0.0 \
     PORT=7860
 
-# Bundle URL & model path
 ENV MODELS_DIR=/data/models
 ENV PATH_WHISPER=$MODELS_DIR/whisper_hf
 ENV BUNDLE_WHISPER_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/whisper_hf_bundle_20250821_070627.zip"
