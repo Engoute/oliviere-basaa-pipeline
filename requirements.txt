@@ -17,3 +17,6 @@ numpy==1.26.4
 
 # M2M-100
 sentencepiece==0.2.0
+
+git+https://github.com/hubertsiuzdak/snac.git@8f79a71
+
