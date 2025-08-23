@@ -3,6 +3,7 @@ from .fast import speed_tweaks
 speed_tweaks()
 
 import json, traceback
+from os import environ
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -13,18 +14,36 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.5")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.6")
+
+# ---------- Resolve Orpheus acoustic root exactly like in Colab ----------
+def _pick_orpheus_acoustic() -> Path:
+    """
+    Prefer symlinks created by bootstrap.py, then fall back to S.path_orpheus.
+    If a bundle root is passed, auto-select its 'acoustic_model' child.
+    """
+    candidates = [
+        Path("/data/models/orpheus_resolved"),     # generic symlink
+        Path("/data/models/orpheus_3b_resolved"),  # your original symlink
+        Path(S.path_orpheus),                      # env/Config fallback
+    ]
+    for p in candidates:
+        if p.exists():
+            root = p
+            break
+    else:
+        root = Path(S.path_orpheus)
+
+    # If user gives the bundle root, use its acoustic folder
+    if (root / "acoustic_model").exists():
+        return root / "acoustic_model"
+    return root
 
 # ---------- Model init ----------
 ASR_MODEL = ASR(S.path_whisper)
 MT        = M2M(S.path_m2m)
 
-# Ensure we pass the acoustic folder to Orpheus (what worked in Colab)
-_orp_root = Path(S.path_orpheus)  # may be bundle root or already acoustic folder
-if (_orp_root / "acoustic_model").exists():
-    _acoustic_dir = _orp_root / "acoustic_model"
-else:
-    _acoustic_dir = _orp_root
+_acoustic_dir = _pick_orpheus_acoustic()
 TTS       = Orpheus(str(_acoustic_dir), sr_out=S.tts_sr)
 
 QWEN      = QwenAgent(S.path_qwen)
