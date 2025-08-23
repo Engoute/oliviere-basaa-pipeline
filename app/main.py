@@ -3,6 +3,7 @@ from .fast import speed_tweaks
 speed_tweaks()
 
 import json, traceback
+from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from .config import S
@@ -12,17 +13,27 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.4")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.5")
 
+# ---------- Model init ----------
 ASR_MODEL = ASR(S.path_whisper)
 MT        = M2M(S.path_m2m)
-TTS       = Orpheus(S.path_orpheus, sr_out=S.tts_sr)
+
+# Ensure we pass the acoustic folder to Orpheus (what worked in Colab)
+_orp_root = Path(S.path_orpheus)  # may be bundle root or already acoustic folder
+if (_orp_root / "acoustic_model").exists():
+    _acoustic_dir = _orp_root / "acoustic_model"
+else:
+    _acoustic_dir = _orp_root
+TTS       = Orpheus(str(_acoustic_dir), sr_out=S.tts_sr)
+
 QWEN      = QwenAgent(S.path_qwen)
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
 
+# ---------- Endpoints ----------
 @app.websocket("/ws/asr")
 async def ws_asr(ws: WebSocket):
     await ws.accept()
@@ -88,7 +99,7 @@ async def ws_translate(ws: WebSocket):
         fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
         lg_text = MT.to_lg(text, wlang)
         wav = TTS.tts(lg_text)
-        if wav.size > 0:
+        if getattr(wav, "size", 0) > 0:
             wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
 
     await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
@@ -127,7 +138,7 @@ async def ws_audio_chat(ws: WebSocket):
     # 4) FR -> Basaa + TTS
     basaa = MT.to_lg(qwen_fr, "fr")
     wav = TTS.tts(basaa)
-    wav_bytes = wav_bytes_from_float32(wav, S.tts_sr) if wav.size > 0 else None
+    wav_bytes = wav_bytes_from_float32(wav, S.tts_sr) if getattr(wav, "size", 0) > 0 else None
 
     # 5) Return JSON + single WAV frame
     await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
