@@ -109,7 +109,9 @@ def _resolve_orpheus_acoustic(base: Path) -> Optional[Path]:
 
 def _find_vocoder_dir(base: Path) -> Optional[Path]:
     for d in base.rglob("vocoder"):
-        if (d / "config.json").exists() and (d / "pytorch_model.bin").exists():
+        if (d / "config.json").exists() and (
+            (d / "pytorch_model.bin").exists() or any((d).glob("*.safetensors"))
+        ):
             return d
     return None
 
@@ -153,7 +155,9 @@ def main():
     if orpheus_url: _fetch_and_unzip(orpheus_url, path_orpheus)
     ac_dir = _resolve_orpheus_acoustic(path_orpheus)
     if ac_dir:
+        # Keep your original symlink AND add a generic one for future-proofing
         _mk_symlink("orpheus_3b_resolved", ac_dir)
+        _mk_symlink("orpheus_resolved", ac_dir)
         print(f"[bootstrap] Orpheus acoustic resolved -> {ac_dir}")
     else:
         print(f"[bootstrap] WARN: could not resolve Orpheus acoustic dir under {path_orpheus}")
