@@ -2,8 +2,7 @@
 from .fast import speed_tweaks
 speed_tweaks()
 
-import json, traceback
-from os import environ
+import json, traceback, os
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -14,45 +13,48 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.6")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.4")
 
-# ---------- Resolve Orpheus acoustic root exactly like in Colab ----------
-def _pick_orpheus_acoustic() -> Path:
+# ---------- helpers: resolve Orpheus acoustic dir ----------
+def _resolve_orpheus_acoustic_dir(bundle_root: str) -> Path:
     """
-    Prefer symlinks created by bootstrap.py, then fall back to S.path_orpheus.
-    If a bundle root is passed, auto-select its 'acoustic_model' child.
+    Prefer the bootstrap symlink if present, otherwise walk the bundle to find
+    a directory that contains both config.json and tokenizer.json (and weights).
+    Returns a directory path, never a file.
     """
-    candidates = [
-        Path("/data/models/orpheus_resolved"),     # generic symlink
-        Path("/data/models/orpheus_3b_resolved"),  # your original symlink
-        Path(S.path_orpheus),                      # env/Config fallback
-    ]
-    for p in candidates:
-        if p.exists():
-            root = p
-            break
-    else:
-        root = Path(S.path_orpheus)
+    models_dir = Path(os.environ.get("MODELS_DIR", "/data/models"))
+    symlink = models_dir / "orpheus_3b_resolved"
+    if symlink.exists():  # bootstrap created it
+        return symlink
 
-    # If user gives the bundle root, use its acoustic folder
-    if (root / "acoustic_model").exists():
-        return root / "acoustic_model"
-    return root
+    base = Path(bundle_root)
+    if (base / "config.json").exists() and (base / "tokenizer.json").exists():
+        return base
 
-# ---------- Model init ----------
+    for cfg in base.rglob("config.json"):
+        d = cfg.parent
+        if (d / "tokenizer.json").exists():
+            # bonus: ensure some weights are there
+            if (d / "model.safetensors").exists() or list(d.glob("model-*.safetensors")):
+                return d
+
+    # Fallback: just return the provided root; Orpheus __init__ will sanitize again.
+    return base
+
+# ---------- model singletons ----------
 ASR_MODEL = ASR(S.path_whisper)
 MT        = M2M(S.path_m2m)
 
-_acoustic_dir = _pick_orpheus_acoustic()
-TTS       = Orpheus(str(_acoustic_dir), sr_out=S.tts_sr)
+_acoustic_dir = _resolve_orpheus_acoustic_dir(S.path_orpheus)
+print(f"[main] Orpheus acoustic dir -> {_acoustic_dir}")
 
-QWEN      = QwenAgent(S.path_qwen)
+TTS   = Orpheus(str(_acoustic_dir), sr_out=S.tts_sr)
+QWEN  = QwenAgent(S.path_qwen)
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
 
-# ---------- Endpoints ----------
 @app.websocket("/ws/asr")
 async def ws_asr(ws: WebSocket):
     await ws.accept()
@@ -118,7 +120,7 @@ async def ws_translate(ws: WebSocket):
         fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
         lg_text = MT.to_lg(text, wlang)
         wav = TTS.tts(lg_text)
-        if getattr(wav, "size", 0) > 0:
+        if wav.size > 0:
             wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
 
     await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
@@ -147,18 +149,14 @@ async def ws_audio_chat(ws: WebSocket):
 
     # 1) ASR
     user_text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
-
     # 2) Normalize to French
     user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
-
     # 3) Qwen chat (FR persona)
     qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
-
     # 4) FR -> Basaa + TTS
     basaa = MT.to_lg(qwen_fr, "fr")
     wav = TTS.tts(basaa)
-    wav_bytes = wav_bytes_from_float32(wav, S.tts_sr) if getattr(wav, "size", 0) > 0 else None
-
+    wav_bytes = wav_bytes_from_float32(wav, S.tts_sr) if wav.size > 0 else None
     # 5) Return JSON + single WAV frame
     await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
     if wav_bytes:
