@@ -98,7 +98,6 @@ class Orpheus:
         if st_bin.exists():
             state = torch.load(st_bin, map_location=self.device)
         else:
-            # Prefer first *.safetensors found if bin is missing
             st_any = sorted(vocoder_dir.glob("*.safetensors"))
             if not st_any:
                 raise FileNotFoundError(f"[tts] No vocoder weights found in {vocoder_dir}")
@@ -260,9 +259,22 @@ class Orpheus:
             self.closed = False
 
         def put(self, value):
-            # value: LongTensor [1, N] newly generated ids
-            ids = value.tolist()[0]
-            for tid in ids:
+            """
+            HF passes either:
+              • LongTensor of shape (B,) or (1, N)  -> iterate over all ids
+              • Python int (scalar)                 -> single id
+            Normalize to a list of ints.
+            """
+            ids_list: List[int]
+            if isinstance(value, torch.Tensor):
+                ids_list = value.view(-1).tolist()
+            elif isinstance(value, (list, tuple)):
+                ids_list = list(value)
+            else:
+                # scalar
+                ids_list = [int(value)]
+
+            for tid in ids_list:
                 # Only collect audio tokens; stop at first non-audio token.
                 if self.p._is_audio_token(tid, self.gen_index):
                     self.buf.append(tid)
@@ -287,7 +299,6 @@ class Orpheus:
                     break
 
         def end(self):
-            # Final flush (in case model ended exactly on frame boundary)
             frames_ready = (len(self.buf) // 7)
             if frames_ready > 0:
                 take = frames_ready * 7
@@ -301,7 +312,6 @@ class Orpheus:
                 return
             with torch.inference_mode():
                 wav = self.p.voc.decode(codes).detach().float().cpu().numpy().squeeze()
-            # Ensure 1-D float32
             wav = np.asarray(wav, dtype=np.float32).reshape(-1)
             if wav.size:
                 self.on_chunk(wav)
@@ -319,7 +329,6 @@ class Orpheus:
         on_chunk: callable(np.ndarray float32 mono) -> None
         chunk_ms: approx window length for each chunk (converted to frames with fps).
         """
-        # Approx frames per chunk
         frames_per_chunk = max(7, int(self.frames_per_sec * (chunk_ms / 1000.0)))
 
         bos = self.tok.bos_token or "<s>"
@@ -339,7 +348,6 @@ class Orpheus:
         streamer = Orpheus._AudioTokenStreamer(self, on_chunk, frames_per_chunk)
 
         with torch.inference_mode():
-            # This call runs until generation ends; streamer.put() is called along the way.
             self.lm.generate(
                 in_ids,
                 attention_mask=attn,
@@ -348,4 +356,4 @@ class Orpheus:
                 pad_token_id=pad_id,
                 streamer=streamer,
             )
-        # streamer.end() is invoked by HF generate()
+        # streamer.end() is called by HF
