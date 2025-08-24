@@ -1,10 +1,14 @@
 # FILE: app/main.py
+from __future__ import annotations
+
 from .fast import speed_tweaks
 speed_tweaks()
 
 import json, traceback
+import numpy as np  # <-- needed for np.ndarray annotations in streaming callbacks
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
+
 from .config import S
 from .asr_whisper import ASR
 from .mt_m2m import M2M
@@ -12,12 +16,23 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.5")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.6")
 
+# ---- model singletons (init at startup; logs help validate correct dirs) ----
+print(f"[main] Initializing models…")
+print(f"[main]  PATH_WHISPER = {S.path_whisper}")
 ASR_MODEL = ASR(S.path_whisper)
+
+print(f"[main]  PATH_M2M     = {S.path_m2m}")
 MT        = M2M(S.path_m2m)
+
+print(f"[main]  PATH_ORPHEUS  = {S.path_orpheus}")
 TTS       = Orpheus(S.path_orpheus, sr_out=S.tts_sr)
+
+print(f"[main]  PATH_QWEN     = {S.path_qwen}")
 QWEN      = QwenAgent(S.path_qwen)
+
+print(f"[main] Models ready.")
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
@@ -33,7 +48,8 @@ async def ws_asr(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
                 if "text" in msg:
-                    if msg["text"] == "DONE": break
+                    if msg["text"] == "DONE":
+                        break
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
@@ -69,7 +85,8 @@ async def ws_translate(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
                 if "text" in msg:
-                    if msg["text"] == "DONE": break
+                    if msg["text"] == "DONE":
+                        break
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
@@ -106,7 +123,8 @@ async def ws_audio_chat(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
                 if "text" in msg:
-                    if msg["text"] == "DONE": break
+                    if msg["text"] == "DONE":
+                        break
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
