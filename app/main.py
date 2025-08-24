@@ -4,14 +4,14 @@ from __future__ import annotations
 from .fast import speed_tweaks
 speed_tweaks()
 
-import json, traceback
+import json, traceback, asyncio
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 
 from .config import S
 from .asr_whisper import ASR
-from .mt_m2m import M2M
+from .mt_m2m import M2M, looks_like_fr
 from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
@@ -38,8 +38,8 @@ print(f"[main] Models ready.")
 def healthz():
     return "ok"
 
-# ---------- helper to read all bytes over WS ----------
-async def _recv_all_bytes(ws: WebSocket) -> bytes | None:
+# -------------------- helpers --------------------
+async def _recv_all_binary(ws: WebSocket) -> bytes:
     buf = bytearray()
     try:
         while True:
@@ -51,151 +51,188 @@ async def _recv_all_bytes(ws: WebSocket) -> bytes | None:
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
-                return None
+                return bytes(buf)
     except WebSocketDisconnect:
-        return None
+        pass
     except Exception:
-        traceback.print_exc(); await ws.close(); return None
+        traceback.print_exc()
     return bytes(buf)
 
-# -------------------- existing non-streaming endpoints --------------------
+def _ensure_french(s: str) -> str:
+    # Qwen *should* answer in FR. If we detect it's not FR, translate EN->FR as a safety net.
+    # (We only implement EN->FR fallback because Qwen input is EN in chat mode.)
+    if looks_like_fr(s):
+        return s
+    try:
+        return MT.to_fr(s, "en")
+    except Exception:
+        return s
+
+# -------------------- ASR (non-streaming) --------------------
 @app.websocket("/ws/asr")
 async def ws_asr(ws: WebSocket):
     await ws.accept()
-    data = await _recv_all_bytes(ws)
-    if data is None: return
-    text, lang, conf = ASR_MODEL.transcribe(data)
-    await ws.send_text(json.dumps({"text": text, "lang": lang, "lang_conf": conf}, ensure_ascii=False))
-    await ws.close()
-
-@app.websocket("/ws/translate_text")
-async def ws_translate_text(ws: WebSocket):
-    await ws.accept()
     try:
-        text = (await ws.receive_text()).strip()
-        is_basaa = any(c in "ŋɓƁàáâèéêìíîòóôùúûɛɔ" for c in text.lower())
-        out = MT.to_fr(text, "lg") if is_basaa else MT.to_lg(text, "fr")
-        await ws.send_text(out)
+        data = await _recv_all_binary(ws)
+        text, lang, conf = ASR_MODEL.transcribe(data)
+        await ws.send_text(json.dumps({"text": text, "lang": lang, "lang_conf": conf}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
     finally:
         await ws.close()
 
-# ✅ NEW: text-only chat endpoint (Qwen FR persona). Returns {"fr": "...", "lg": "..."}.
+# -------------------- TRANSLATE (TEXT) --------------------
+@app.websocket("/ws/translate_text")
+async def ws_translate_text(ws: WebSocket):
+    await ws.accept()
+    try:
+        # RAW text frame from client
+        text = (await ws.receive_text()).strip()
+        # We do not have Whisper hint here (text input), pass None
+        src = MT.resolve_safe_src(text, whisper_hint=None)
+        fr_text = MT.to_fr(text, src)
+        lg_text = MT.to_lg(text, src)
+        await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
+    except Exception:
+        traceback.print_exc()
+    finally:
+        await ws.close()
+
+# -------------------- CHAT (TEXT) — NEW --------------------
 @app.websocket("/ws/chat_text")
 async def ws_chat_text(ws: WebSocket):
     await ws.accept()
     try:
         user_text = (await ws.receive_text()).strip()
-        is_basaa = any(c in "ŋɓƁàáâèéêìíîòóôùúûɛɔ" for c in user_text.lower())
-        user_fr  = MT.to_fr(user_text, "lg") if is_basaa else user_text
-        reply_fr = QWEN.chat_fr(user_fr, temperature=0.2)
-        reply_lg = MT.to_lg(reply_fr, "fr")
-        await ws.send_text(json.dumps({"fr": reply_fr, "lg": reply_lg}, ensure_ascii=False))
+        src = MT.resolve_safe_src(user_text, whisper_hint=None)
+
+        # Chat pipeline: normalize to EN → Qwen → ensure FR → FR→LG
+        user_en = MT.to_en(user_text, src)
+        qwen_fr = QWEN.chat_fr(user_en, temperature=0.2)
+        qwen_fr = _ensure_french(qwen_fr)
+        basaa   = MT.to_lg(qwen_fr, "fr")
+
+        await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
     finally:
         await ws.close()
 
+# -------------------- TRANSLATE (AUDIO) --------------------
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
     await ws.accept()
-    data = await _recv_all_bytes(ws)
-    if data is None: return
+    try:
+        data = await _recv_all_binary(ws)
+        text, whisper_hint, _ = ASR_MODEL.transcribe(data)
+        src = MT.resolve_safe_src(text, whisper_hint)
 
-    text, wlang, _ = ASR_MODEL.transcribe(data)
+        fr_text = MT.to_fr(text, src)
+        lg_text = MT.to_lg(text, src)
 
-    wav_bytes = None
-    if wlang == "lg":
-        fr_text = MT.to_fr(text, "lg")
-        lg_text = text
-    else:
-        fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
-        lg_text = MT.to_lg(text, wlang)
+        wav_bytes = None
+        # Always TTS Basaa in Translate mode
         wav = TTS.tts(lg_text)
         if wav.size > 0:
             wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
 
-    await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
-    if wav_bytes:
-        await ws.send_bytes(wav_bytes)
-    await ws.close()
+        await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
+        if wav_bytes:
+            await ws.send_bytes(wav_bytes)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        await ws.close()
 
+# -------------------- CHAT (AUDIO) --------------------
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(ws: WebSocket):
     await ws.accept()
-    data = await _recv_all_bytes(ws)
-    if data is None: return
+    try:
+        data = await _recv_all_binary(ws)
+        user_text, whisper_hint, _ = ASR_MODEL.transcribe(data)
+        src = MT.resolve_safe_src(user_text, whisper_hint)
 
-    # 1) ASR
-    user_text, wlang, _ = ASR_MODEL.transcribe(data)
+        # Chat pipeline: to EN → Qwen (FR) → ensure FR → FR→LG → TTS(LG)
+        user_en = MT.to_en(user_text, src)
+        qwen_fr = QWEN.chat_fr(user_en, temperature=0.2)
+        qwen_fr = _ensure_french(qwen_fr)
+        basaa   = MT.to_lg(qwen_fr, "fr")
 
-    # 2) Normalize to French
-    user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
+        wav_bytes = None
+        wav = TTS.tts(basaa)
+        if wav.size > 0:
+            wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
 
-    # 3) Qwen chat (FR persona)
-    qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+        await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
+        if wav_bytes:
+            await ws.send_bytes(wav_bytes)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        await ws.close()
 
-    # 4) FR -> Basaa + TTS
-    basaa = MT.to_lg(qwen_fr, "fr")
-    wav = TTS.tts(basaa)
-    wav_bytes = wav_bytes_from_float32(wav, S.tts_sr) if wav.size > 0 else None
-
-    # 5) Return JSON + single WAV frame
-    await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
-    if wav_bytes:
-        await ws.send_bytes(wav_bytes)
-    await ws.close()
-
-# -------------------- streaming endpoints (PCM float32) --------------------
+# -------------------- TRANSLATE (AUDIO STREAM) --------------------
 @app.websocket("/ws/translate_stream")
 async def ws_translate_stream(ws: WebSocket):
     await ws.accept()
-    data = await _recv_all_bytes(ws)
-    if data is None: return
-
-    text, wlang, _ = ASR_MODEL.transcribe(data)
-    if wlang == "lg":
-        fr_text, lg_text = MT.to_fr(text, "lg"), text
-    else:
-        fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
-        lg_text = MT.to_lg(text, wlang)
-
-    await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
-    await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
-
     try:
+        data = await _recv_all_binary(ws)
+        text, whisper_hint, _ = ASR_MODEL.transcribe(data)
+        src = MT.resolve_safe_src(text, whisper_hint)
+
+        fr_text = MT.to_fr(text, src)
+        lg_text = MT.to_lg(text, src)
+
+        # Send text first
+        await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
+        # Audio header (float32 mono)
+        await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
+
         def on_chunk(pcm: np.ndarray):
-            import asyncio
             asyncio.create_task(ws.send_bytes(pcm.tobytes(order="C")))
-        TTS.stream_tts(lg_text, on_chunk=on_chunk, chunk_ms=600)
+
+        try:
+            TTS.stream_tts(lg_text, on_chunk=on_chunk, chunk_ms=600)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            await ws.send_text("DONE")
     except Exception:
         traceback.print_exc()
     finally:
-        await ws.send_text("DONE")
         await ws.close()
 
+# -------------------- CHAT (AUDIO STREAM) --------------------
 @app.websocket("/ws/audio_chat_stream")
 async def ws_audio_chat_stream(ws: WebSocket):
     await ws.accept()
-    data = await _recv_all_bytes(ws)
-    if data is None: return
-
-    user_text, wlang, _ = ASR_MODEL.transcribe(data)
-    user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
-    qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
-    basaa  = MT.to_lg(qwen_fr, "fr")
-
-    await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
-    await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
-
     try:
+        data = await _recv_all_binary(ws)
+        user_text, whisper_hint, _ = ASR_MODEL.transcribe(data)
+        src = MT.resolve_safe_src(user_text, whisper_hint)
+
+        # Chat pipeline: to EN → Qwen (FR) → ensure FR → FR→LG
+        user_en = MT.to_en(user_text, src)
+        qwen_fr = QWEN.chat_fr(user_en, temperature=0.2)
+        qwen_fr = _ensure_french(qwen_fr)
+        basaa   = MT.to_lg(qwen_fr, "fr")
+
+        # Send reply text first
+        await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
+        # Audio header
+        await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
+
         def on_chunk(pcm: np.ndarray):
-            import asyncio
             asyncio.create_task(ws.send_bytes(pcm.tobytes(order="C")))
-        TTS.stream_tts(basaa, on_chunk=on_chunk, chunk_ms=600)
+
+        try:
+            TTS.stream_tts(basaa, on_chunk=on_chunk, chunk_ms=600)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            await ws.send_text("DONE")
     except Exception:
         traceback.print_exc()
     finally:
-        await ws.send_text("DONE")
         await ws.close()
