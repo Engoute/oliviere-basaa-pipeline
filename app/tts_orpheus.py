@@ -9,13 +9,17 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.generation.streamers import BaseStreamer
 
+# Avoid tokenizer parallelism spam; safe default for services
+import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 class Orpheus:
     """
     Orpheus-3B acoustic model + SNAC vocoder.
 
     ✅ Uses FAST tokenizer from the acoustic directory (tokenizer.json).
-    ✅ Provides non-streaming tts() and NEW low-latency stream_tts(...) that yields PCM chunks.
+    ✅ Provides non-streaming tts() and low-latency stream_tts(...) that yields PCM chunks.
 
     stream_tts emits float32 mono PCM chunks via a callback while generation runs,
     so the server can forward them over WS incrementally.
@@ -30,32 +34,57 @@ class Orpheus:
         self.sr = int(sr_out)
 
         acoustic = self._resolve_acoustic_dir(bundle_root)
-        assert (acoustic / "config.json").exists(), f"[tts] Orpheus config.json not found in {acoustic}"
+        if not (acoustic.exists() and acoustic.is_dir()):
+            raise ValueError(f"[tts] acoustic path must be a directory, got: {acoustic}")
+        if not (acoustic / "config.json").exists():
+            raise FileNotFoundError(f"[tts] Orpheus config.json not found in {acoustic}")
+        if not (acoustic / "tokenizer.json").exists():
+            raise FileNotFoundError(f"[tts] Orpheus tokenizer.json not found in {acoustic}")
+        print(f"[tts] acoustic dir = {acoustic}")
 
         # FAST tokenizer (required for tokenizer.json)
-        self.tok = AutoTokenizer.from_pretrained(
-            str(acoustic),
-            local_files_only=True,
-            use_fast=True,
-            trust_remote_code=True,
-        )
+        try:
+            self.tok = AutoTokenizer.from_pretrained(
+                str(acoustic),
+                local_files_only=True,
+                use_fast=True,
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[tts] Failed to load FAST tokenizer from directory: {acoustic}\n"
+                f"Hint: pass the ACOUSTIC DIRECTORY (not tokenizer.json file)."
+            ) from e
 
-        self.lm = AutoModelForCausalLM.from_pretrained(
-            str(acoustic),
-            local_files_only=True,
-            trust_remote_code=True,
-            torch_dtype=self.dtype,
-            low_cpu_mem_usage=True,
-        ).to(self.device).eval()
+        try:
+            self.lm = AutoModelForCausalLM.from_pretrained(
+                str(acoustic),
+                local_files_only=True,
+                trust_remote_code=True,
+                torch_dtype=self.dtype,
+                low_cpu_mem_usage=True,
+            ).to(self.device).eval()
+        except Exception as e:
+            raise RuntimeError(f"[tts] Failed to load acoustic LM from {acoustic}") from e
 
-        # Vocoder
-        vocoder_dir = Path(bundle_root) / "vocoder"
+        # Vocoder (resolve robustly)
+        vocoder_dir = self._find_vocoder_dir(Path(bundle_root))
+        if vocoder_dir is None:
+            raise FileNotFoundError(
+                f"[tts] vocoder assets not found under bundle root: {bundle_root}\n"
+                f"Expected a folder like .../vocoder/ with config.json + pytorch_model.bin (or *.safetensors)."
+            )
         cfg = vocoder_dir / "config.json"
-        st  = vocoder_dir / "pytorch_model.bin"
-        assert cfg.exists() and st.exists(), f"[tts] vocoder assets missing under {vocoder_dir}"
+        st_bin = vocoder_dir / "pytorch_model.bin"
+        if not cfg.exists():
+            raise FileNotFoundError(f"[tts] Missing vocoder config.json at {cfg}")
+        if (not st_bin.exists()) and not list(vocoder_dir.glob("*.safetensors")):
+            raise FileNotFoundError(f"[tts] Missing vocoder weights at {vocoder_dir}")
+        print(f"[tts] vocoder dir = {vocoder_dir}")
 
         with open(cfg, "r", encoding="utf-8") as f:
             vcfg = json.load(f)
+
         # Try to derive frames-per-second from config; fall back to ~75 fps if unknown.
         self.sr = int(vcfg.get("sampling_rate", self.sr))
         hop = vcfg.get("hop_length")
@@ -63,23 +92,52 @@ class Orpheus:
 
         from snac import SNAC
         self.voc = SNAC(**vcfg).to(self.device).eval()
-        state = torch.load(st, map_location=self.device)
+
+        # Load weights (bin or safetensors; SNAC uses torch.load state_dict matching)
+        state = None
+        if st_bin.exists():
+            state = torch.load(st_bin, map_location=self.device)
+        else:
+            # Prefer first *.safetensors found if bin is missing
+            st_any = sorted(vocoder_dir.glob("*.safetensors"))
+            if not st_any:
+                raise FileNotFoundError(f"[tts] No vocoder weights found in {vocoder_dir}")
+            state = torch.load(st_any[0], map_location=self.device)
+
         sd = self.voc.state_dict()
         ok = {k: v for k, v in state.items() if k in sd and v.shape == sd[k].shape}
+        missing = [k for k in sd.keys() if k not in ok]
+        if missing:
+            print(f"[tts] WARN: vocoder missing {len(missing)} keys (loading partial state)")
         self.voc.load_state_dict(ok, strict=False)
 
-        print(f"[tts] Orpheus ready (sr={self.sr} Hz)")
+        print(f"[tts] Orpheus ready (sr={self.sr} Hz, device={self.device})")
 
     # ---------- path resolution ----------
-    def _resolve_acoustic_dir(self, bundle_root: str) -> Path:
-        symlink = Path("/data/models/orpheus_3b_resolved")
-        if symlink.exists() and symlink.is_dir():
-            return symlink
+    @staticmethod
+    def _ensure_dir_path(p: Path) -> Path:
+        try:
+            if p.is_file():
+                return p.parent
+        except Exception:
+            pass
+        return p
 
-        base = Path(bundle_root)
-        if (base / "config.json").exists() and (base / "tokenizer.json").exists():
+    def _resolve_acoustic_dir(self, bundle_root: str) -> Path:
+        # Prefer stable symlinks created by bootstrap
+        for link in (Path("/data/models/orpheus_3b_resolved"), Path("/data/models/orpheus_resolved")):
+            if link.exists() and link.is_dir():
+                return link
+
+        base = self._ensure_dir_path(Path(bundle_root))
+
+        # Direct hit (requires tokenizer.json + weights)
+        if (base / "config.json").exists() and (base / "tokenizer.json").exists() and (
+            (base / "model.safetensors").exists() or any(base.glob("model-*.safetensors"))
+        ):
             return base
 
+        # Search for the shallowest valid acoustic directory
         best: Optional[Path] = None
         for cfg in base.rglob("config.json"):
             d = cfg.parent
@@ -88,6 +146,24 @@ class Orpheus:
                 if has_weights and (best is None or len(str(d)) < len(str(best))):
                     best = d
         return best or base
+
+    @staticmethod
+    def _find_vocoder_dir(root: Path) -> Optional[Path]:
+        root = Orpheus._ensure_dir_path(root)
+        # Look for explicit "vocoder" first
+        for d in root.rglob("vocoder"):
+            if (d / "config.json").exists() and (
+                (d / "pytorch_model.bin").exists() or any(d.glob("*.safetensors"))
+            ):
+                return d
+        # Fallback: any folder that looks like a vocoder package
+        for cfg in root.rglob("config.json"):
+            d = cfg.parent
+            if "vocoder" in str(d).lower() and (
+                (d / "pytorch_model.bin").exists() or any(d.glob("*.safetensors"))
+            ):
+                return d
+        return None
 
     # ---------- token → code helpers ----------
     def _is_audio_token(self, t: int, i: int) -> bool:
@@ -167,7 +243,7 @@ class Orpheus:
 
         return np.asarray(wav, dtype=np.float32).reshape(-1)
 
-    # ---------- NEW: streaming decode ----------
+    # ---------- streaming decode ----------
     class _AudioTokenStreamer(BaseStreamer):
         def __init__(
             self,
