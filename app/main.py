@@ -5,7 +5,7 @@ from .fast import speed_tweaks
 speed_tweaks()
 
 import json, traceback
-import numpy as np  # <-- needed for np.ndarray annotations in streaming callbacks
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 
@@ -16,9 +16,9 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.6")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.7")
 
-# ---- model singletons (init at startup; logs help validate correct dirs) ----
+# ---- model singletons ----
 print(f"[main] Initializing models…")
 print(f"[main]  PATH_WHISPER = {S.path_whisper}")
 ASR_MODEL = ASR(S.path_whisper)
@@ -38,10 +38,8 @@ print(f"[main] Models ready.")
 def healthz():
     return "ok"
 
-# -------------------- existing non-streaming endpoints --------------------
-@app.websocket("/ws/asr")
-async def ws_asr(ws: WebSocket):
-    await ws.accept()
+# ---------- helper to read all bytes over WS ----------
+async def _recv_all_bytes(ws: WebSocket) -> bytes | None:
     buf = bytearray()
     try:
         while True:
@@ -53,13 +51,20 @@ async def ws_asr(ws: WebSocket):
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
-                return
+                return None
     except WebSocketDisconnect:
-        return
+        return None
     except Exception:
-        traceback.print_exc(); await ws.close(); return
+        traceback.print_exc(); await ws.close(); return None
+    return bytes(buf)
 
-    text, lang, conf = ASR_MODEL.transcribe(bytes(buf))
+# -------------------- existing non-streaming endpoints --------------------
+@app.websocket("/ws/asr")
+async def ws_asr(ws: WebSocket):
+    await ws.accept()
+    data = await _recv_all_bytes(ws)
+    if data is None: return
+    text, lang, conf = ASR_MODEL.transcribe(data)
     await ws.send_text(json.dumps({"text": text, "lang": lang, "lang_conf": conf}, ensure_ascii=False))
     await ws.close()
 
@@ -76,27 +81,29 @@ async def ws_translate_text(ws: WebSocket):
     finally:
         await ws.close()
 
+# ✅ NEW: text-only chat endpoint (Qwen FR persona). Returns {"fr": "...", "lg": "..."}.
+@app.websocket("/ws/chat_text")
+async def ws_chat_text(ws: WebSocket):
+    await ws.accept()
+    try:
+        user_text = (await ws.receive_text()).strip()
+        is_basaa = any(c in "ŋɓƁàáâèéêìíîòóôùúûɛɔ" for c in user_text.lower())
+        user_fr  = MT.to_fr(user_text, "lg") if is_basaa else user_text
+        reply_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+        reply_lg = MT.to_lg(reply_fr, "fr")
+        await ws.send_text(json.dumps({"fr": reply_fr, "lg": reply_lg}, ensure_ascii=False))
+    except Exception:
+        traceback.print_exc()
+    finally:
+        await ws.close()
+
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
     await ws.accept()
-    buf = bytearray()
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.receive":
-                if "text" in msg:
-                    if msg["text"] == "DONE":
-                        break
-                elif "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
-            elif msg["type"] == "websocket.disconnect":
-                return
-    except WebSocketDisconnect:
-        return
-    except Exception:
-        traceback.print_exc(); await ws.close(); return
+    data = await _recv_all_bytes(ws)
+    if data is None: return
 
-    text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
+    text, wlang, _ = ASR_MODEL.transcribe(data)
 
     wav_bytes = None
     if wlang == "lg":
@@ -117,25 +124,11 @@ async def ws_translate(ws: WebSocket):
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(ws: WebSocket):
     await ws.accept()
-    buf = bytearray()
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.receive":
-                if "text" in msg:
-                    if msg["text"] == "DONE":
-                        break
-                elif "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
-            elif msg["type"] == "websocket.disconnect":
-                return
-    except WebSocketDisconnect:
-        return
-    except Exception:
-        traceback.print_exc(); await ws.close(); return
+    data = await _recv_all_bytes(ws)
+    if data is None: return
 
     # 1) ASR
-    user_text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
+    user_text, wlang, _ = ASR_MODEL.transcribe(data)
 
     # 2) Normalize to French
     user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
@@ -154,56 +147,27 @@ async def ws_audio_chat(ws: WebSocket):
         await ws.send_bytes(wav_bytes)
     await ws.close()
 
-# -------------------- NEW: streaming endpoints (PCM chunks) --------------------
-# Protocol:
-#   • Server first sends a JSON header: {"sr": 24000, "format": "pcm_f32"}
-#   • Then sends multiple binary frames (float32 mono PCM).
-#   • Finally sends a "DONE" text frame and closes.
-#
-# NOTE: Your current MAUI client buffers a single WAV. To hear audio live, the client
-# must stream-play float32 PCM (e.g., Android AudioTrack). Server support is here; client change is next step.
-
+# -------------------- streaming endpoints (PCM float32) --------------------
 @app.websocket("/ws/translate_stream")
 async def ws_translate_stream(ws: WebSocket):
     await ws.accept()
-    buf = bytearray()
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.receive":
-                if "text" in msg and msg["text"] == "DONE":
-                    break
-                if "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
-            elif msg["type"] == "websocket.disconnect":
-                return
-    except WebSocketDisconnect:
-        return
-    except Exception:
-        traceback.print_exc(); await ws.close(); return
+    data = await _recv_all_bytes(ws)
+    if data is None: return
 
-    text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
+    text, wlang, _ = ASR_MODEL.transcribe(data)
     if wlang == "lg":
         fr_text, lg_text = MT.to_fr(text, "lg"), text
     else:
         fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
         lg_text = MT.to_lg(text, wlang)
 
-    # Send transcript/translation first
     await ws.send_text(json.dumps({"fr": fr_text, "lg": lg_text}, ensure_ascii=False))
-
-    # Stream header for audio (PCM float32)
     await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
 
-    # Stream PCM chunks
     try:
         def on_chunk(pcm: np.ndarray):
-            # Send as bytes (float32 little-endian)
-            ws_bytes = pcm.tobytes(order="C")
-            # Note: awaiting inside callback is tricky; use create_task
             import asyncio
-            asyncio.create_task(ws.send_bytes(ws_bytes))
-
+            asyncio.create_task(ws.send_bytes(pcm.tobytes(order="C")))
         TTS.stream_tts(lg_text, on_chunk=on_chunk, chunk_ms=600)
     except Exception:
         traceback.print_exc()
@@ -214,34 +178,17 @@ async def ws_translate_stream(ws: WebSocket):
 @app.websocket("/ws/audio_chat_stream")
 async def ws_audio_chat_stream(ws: WebSocket):
     await ws.accept()
-    buf = bytearray()
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.receive":
-                if "text" in msg and msg["text"] == "DONE":
-                    break
-                if "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
-            elif msg["type"] == "websocket.disconnect":
-                return
-    except WebSocketDisconnect:
-        return
-    except Exception:
-        traceback.print_exc(); await ws.close(); return
+    data = await _recv_all_bytes(ws)
+    if data is None: return
 
-    user_text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
+    user_text, wlang, _ = ASR_MODEL.transcribe(data)
     user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
     qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
     basaa  = MT.to_lg(qwen_fr, "fr")
 
-    # Send reply text first
     await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
-
-    # Send audio header
     await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
 
-    # Stream PCM chunks
     try:
         def on_chunk(pcm: np.ndarray):
             import asyncio
