@@ -45,7 +45,6 @@ def _resolve_hf_dir(base: Path) -> Path | None:
     return best
 
 def _try_load_tokenizer(use: Path):
-    # Prefer SLOW tokenizer (use_fast=False) to bypass problematic tokenizer.json
     attempts = [
         dict(subfolder="processor", use_fast=False),
         dict(subfolder=None,        use_fast=False),
@@ -84,7 +83,6 @@ class ASR:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
-        # Prefer the resolved symlink first (created by bootstrap)
         candidates = [Path("/data/models/whisper_hf_resolved")]
         if base_path:
             candidates.append(Path(base_path))
@@ -98,7 +96,6 @@ class ASR:
         if use is None:
             raise RuntimeError(f"HF Whisper not found. Tried: {candidates}")
 
-        # Avoid relying on Processor (it tends to pick fast); go straight to explicit loads
         self.tok  = _try_load_tokenizer(use)
         self.feat = _try_load_feature_extractor(use)
 
@@ -109,7 +106,6 @@ class ASR:
             low_cpu_mem_usage=True,
         ).to(self.device).eval()
 
-        # Build language token -> id map (incl. lg/basaa aliases)
         self.lang_to_id = {}
         for code in (
             "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
@@ -140,8 +136,14 @@ class ASR:
 
     def transcribe(self, wav16k: bytes):
         pcm = self._pcm16_to_float(wav16k)
-        feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")
-                 .input_features.to(self.device).to(self.hf.dtype))
+
+        # HF 4.45 expects raw_speech=…, older variants accepted audio=…
+        try:
+            feats = (self.feat(raw_speech=pcm, sampling_rate=16000, return_tensors="pt")
+                     .input_features.to(self.device).to(self.hf.dtype))
+        except TypeError:
+            feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")   # fallback
+                     .input_features.to(self.device).to(self.hf.dtype))
 
         code, conf = self._detect_lang(feats)
 
