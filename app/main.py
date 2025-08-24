@@ -6,7 +6,6 @@ speed_tweaks()
 
 import asyncio
 import json
-import re
 import traceback
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -20,9 +19,9 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="1.1")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.9")
 
-# ─────────────────────────── models ───────────────────────────
+# ---- model singletons --------------------------------------------------------
 print(f"[main] Initializing models…")
 print(f"[main]  PATH_WHISPER = {S.path_whisper}")
 ASR_MODEL = ASR(S.path_whisper)
@@ -38,27 +37,7 @@ QWEN      = QwenAgent(S.path_qwen)
 
 print(f"[main] Models ready.")
 
-# ─────────────────────────── helpers ───────────────────────────
-_BASAA_CHARS = set("ŋɓƁàáâèéêìíîòóôùúûɛɔ")
-_FR_DIACRIT  = set("àâäæçéèêëîïôœùûüÿ")
-_FR_COMMON   = {" le ", " la ", " les ", " des ", " de ", " du ", " un ", " une ",
-                " je ", " tu ", " il ", " elle ", " nous ", " vous ", " et ",
-                " que ", " qui ", " est ", " pour ", " avec ", " pas "}
-
-def _guess_lang_code(s: str) -> str:
-    """
-    Tiny heuristic → {"lg","fr","en"}; keeps M2M happy regardless of Whisper’s tag.
-    """
-    if not s:
-        return "fr"
-    l = f" {s.lower()} "
-    if any(c in _BASAA_CHARS for c in l):
-        return "lg"
-    if any(c in _FR_DIACRIT for c in l) or any(w in l for w in _FR_COMMON):
-        return "fr"
-    letters = re.sub(r"[^a-z]", "", l)
-    return "en" if len(letters) >= 1 else "fr"
-
+# ---- helpers -----------------------------------------------------------------
 async def _safe_close(ws: WebSocket):
     try:
         if getattr(ws, "client_state", None) != WebSocketState.DISCONNECTED:
@@ -66,57 +45,50 @@ async def _safe_close(ws: WebSocket):
     except Exception:
         pass
 
-async def _pcm_sender(ws: WebSocket, q: "asyncio.Queue[tuple[str, bytes|None]]"):
+async def _ws_sender(ws: WebSocket, q: "asyncio.Queue[tuple[str, bytes | str]]"):
     """
-    Serializes WebSocket sends. Queue items:
-      ("bytes", <pcm_bytes>)  -> ws.send_bytes
-      ("header", None)        -> ws.send_text({"sr":..., "format":"pcm_f32"})
-      ("done", None)          -> ws.send_text("DONE")
+    Serialize send() calls. Queue items are ('bin', bytes) or ('txt', str).
+    End with ('end', b'').
     """
     try:
         while True:
-            kind, payload = await q.get()
-            if kind == "stop":
+            kind, data = await q.get()
+            if kind == "end":
                 break
-
-            # Bail if client is gone
             if getattr(ws, "application_state", None) == WebSocketState.DISCONNECTED:
                 break
             if getattr(ws, "client_state", None) == WebSocketState.DISCONNECTED:
                 break
-
             try:
-                if kind == "bytes" and payload is not None:
-                    await ws.send_bytes(payload)
-                elif kind == "header":
-                    await ws.send_text(json.dumps({"sr": S.tts_sr, "format": "pcm_f32"}))
-                elif kind == "done":
-                    await ws.send_text("DONE")
+                if kind == "bin":
+                    await ws.send_bytes(data)         # type: ignore[arg-type]
+                else:
+                    await ws.send_text(data)          # type: ignore[arg-type]
             except Exception:
                 break
     finally:
-        # drain to unblock producers
+        # drain
         try:
-            while not q.empty():
+            while True:
                 q.get_nowait()
         except Exception:
             pass
 
-# ─────────────────────────── health ───────────────────────────
+# ------------------------------------------------------------------------------
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
 
-# ─────────────────────────── TEXT endpoints ───────────────────────────
-# NOTE: return **Basaa only** (raw text).
+# -------------------- TEXT endpoints (Basaa-only payloads) --------------------
 @app.websocket("/ws/translate_text")
 async def ws_translate_text(ws: WebSocket):
     await ws.accept()
     try:
         text = (await ws.receive_text()).strip()
-        src = _guess_lang_code(text)
-        out_lg = text if src == "lg" else MT.to_lg(text, src)
-        await ws.send_text(out_lg)
+        is_basaa = any(c in "ŋɓƁàáâèéêìíîòóôùúûɛɔ" for c in text.lower())
+        # Basaa-only output for text mode
+        out_lg = text if is_basaa else MT.to_lg(text, "fr")
+        await ws.send_text(json.dumps({"lg": out_lg}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
     finally:
@@ -127,17 +99,36 @@ async def ws_chat_text(ws: WebSocket):
     await ws.accept()
     try:
         user_text = (await ws.receive_text()).strip()
-        src = _guess_lang_code(user_text)
-        user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
-        qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+        qwen_fr = QWEN.chat_fr(user_text, temperature=0.2)
         basaa   = MT.to_lg(qwen_fr, "fr")
-        await ws.send_text(basaa)
+        # Basaa-only output for text mode
+        await ws.send_text(json.dumps({"lg": basaa}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
     finally:
         await _safe_close(ws)
 
-# ─────────────────────────── non-streaming AUDIO ───────────────────────────
+# -------------------- Non-streaming TTS (for long-press “Lire à voix haute”) --
+@app.websocket("/ws/tts_once")
+async def ws_tts_once(ws: WebSocket):
+    await ws.accept()
+    try:
+        txt = (await ws.receive_text()).strip()
+        wav = TTS.tts(txt)
+        if wav.size > 0:
+            await ws.send_bytes(wav_bytes_from_float32(wav, S.tts_sr))
+        else:
+            await ws.send_text(json.dumps({"error": "tts_empty"}, ensure_ascii=False))
+    except Exception:
+        traceback.print_exc()
+        try:
+            await ws.send_text(json.dumps({"error": "tts_exception"}, ensure_ascii=False))
+        except Exception:
+            pass
+    finally:
+        await _safe_close(ws)
+
+# -------------------- legacy non-streaming AUDIO ------------------------------
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
     await ws.accept()
@@ -147,8 +138,7 @@ async def ws_translate(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
                 if "text" in msg:
-                    if msg["text"] == "DONE":
-                        break
+                    if msg["text"] == "DONE": break
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
@@ -182,8 +172,7 @@ async def ws_audio_chat(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
                 if "text" in msg:
-                    if msg["text"] == "DONE":
-                        break
+                    if msg["text"] == "DONE": break
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
@@ -206,43 +195,84 @@ async def ws_audio_chat(ws: WebSocket):
         await ws.send_bytes(wav_bytes)
     await _safe_close(ws)
 
-# ─────────────────────────── streaming AUDIO (lazy header + WAV fallback) ───────────────────────────
-def _stream_once(ws: WebSocket, text_for_tts: str) -> tuple[int, asyncio.Queue]:
+# -------------------- STREAMING AUDIO (header-after-first-chunk) --------------
+def _pack_pcm(pcm: np.ndarray) -> bytes:
+    return pcm.astype(np.float32, copy=False).tobytes(order="C")
+
+async def _stream_or_fallback(ws: WebSocket, text_for_tts: str):
     """
-    Start streaming: return (chunk_count, queue). Header is sent lazily on first chunk.
+    Stream PCM if we get chunks; otherwise send a single WAV fallback.
+    Header is sent *after* the first chunk so clients don't hang if the
+    model yields nothing.
     """
-    q: asyncio.Queue[tuple[str, bytes|None]] = asyncio.Queue(maxsize=16)
+    q: asyncio.Queue[tuple[str, bytes | str]] = asyncio.Queue(maxsize=32)
+    sender_task = asyncio.create_task(_ws_sender(ws, q))
+
     chunk_count = 0
-    header_sent = False
-
-    def on_chunk(pcm: np.ndarray):
-        nonlocal chunk_count, header_sent
-        if pcm is None:
-            return
-        try:
-            if not header_sent:
-                header_sent = True
-                # enqueue header first
-                try: q.put_nowait(("header", None))
-                except asyncio.QueueFull: pass
-
-            # enqueue bytes
-            b = pcm.astype(np.float32, copy=False).tobytes(order="C")
-            try:
-                q.put_nowait(("bytes", b))
-                chunk_count += 1
-            except asyncio.QueueFull:
-                # drop if client/network can't keep up
-                pass
-        except Exception:
-            pass
-
     try:
+        def on_chunk(pcm: np.ndarray):
+            nonlocal chunk_count
+            chunk = _pack_pcm(pcm)
+            if chunk_count == 0:
+                # first chunk → send header as a TEXT frame via the same sender
+                try:
+                    q.put_nowait(("txt", json.dumps({"sr": S.tts_sr, "format": "pcm_f32"})))
+                except asyncio.QueueFull:
+                    pass
+            chunk_count += 1
+            try:
+                q.put_nowait(("bin", chunk))
+            except asyncio.QueueFull:
+                # drop if client can't keep up
+                pass
+
+        # This is synchronous; it will invoke on_chunk many times or none.
         TTS.stream_tts(text_for_tts, on_chunk=on_chunk, chunk_ms=600)
+
     except Exception:
         traceback.print_exc()
 
-    return chunk_count, q
+    # wrap up
+    if chunk_count == 0:
+        # No chunks produced → non-streaming fallback
+        try:
+            wav = TTS.tts(text_for_tts)
+            if wav.size > 0:
+                await ws.send_bytes(wav_bytes_from_float32(wav, S.tts_sr))
+            else:
+                await ws.send_text(json.dumps({"error": "tts_empty"}, ensure_ascii=False))
+        except Exception:
+            traceback.print_exc()
+            try:
+                await ws.send_text(json.dumps({"error": "tts_exception"}, ensure_ascii=False))
+            except Exception:
+                pass
+        finally:
+            try: await ws.send_text("DONE")
+            except Exception: pass
+            try:
+                q.put_nowait(("end", b""))
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(sender_task, timeout=2.0)
+            except Exception:
+                pass
+            return
+
+    # Had chunks → finish streaming path
+    try:
+        q.put_nowait(("end", b""))
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(sender_task, timeout=3.0)
+    except Exception:
+        pass
+    try:
+        await ws.send_text("DONE")
+    except Exception:
+        pass
 
 @app.websocket("/ws/translate_stream")
 async def ws_translate_stream(ws: WebSocket):
@@ -252,10 +282,8 @@ async def ws_translate_stream(ws: WebSocket):
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
-                if "text" in msg and msg["text"] == "DONE":
-                    break
-                if "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
+                if "text" in msg and msg["text"] == "DONE": break
+                if "bytes" in msg and msg["bytes"]: buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
                 return
     except WebSocketDisconnect:
@@ -270,41 +298,15 @@ async def ws_translate_stream(ws: WebSocket):
         fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
         lg_text = MT.to_lg(text, wlang)
 
-    # Send transcript + translations first
+    # send texts first (ASR + translations)
     try:
         await ws.send_text(json.dumps({"asr": {"text": text, "lang": wlang},
                                        "fr": fr_text, "lg": lg_text}, ensure_ascii=False))
     except Exception:
         await _safe_close(ws); return
 
-    # Stream with lazy header; fallback to WAV if zero chunks
-    chunk_count, q = _stream_once(ws, lg_text)
-    if chunk_count > 0:
-        sender_task = asyncio.create_task(_pcm_sender(ws, q))
-        try:
-            # mark done
-            try: q.put_nowait(("done", None))
-            except Exception: pass
-            try: q.put_nowait(("stop", None))
-            except Exception: pass
-            try: await asyncio.wait_for(sender_task, timeout=3.0)
-            except Exception: pass
-        finally:
-            try: await ws.send_text("DONE")
-            except Exception: pass
-            await _safe_close(ws)
-        return
-
-    # No chunks → WAV fallback
-    try:
-        wav = TTS.tts(lg_text)
-        if wav.size > 0:
-            wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
-            await ws.send_bytes(wav_bytes)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        await _safe_close(ws)
+    await _stream_or_fallback(ws, lg_text)
+    await _safe_close(ws)
 
 @app.websocket("/ws/audio_chat_stream")
 async def ws_audio_chat_stream(ws: WebSocket):
@@ -314,10 +316,8 @@ async def ws_audio_chat_stream(ws: WebSocket):
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
-                if "text" in msg and msg["text"] == "DONE":
-                    break
-                if "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
+                if "text" in msg and msg["text"] == "DONE": break
+                if "bytes" in msg and msg["bytes"]: buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
                 return
     except WebSocketDisconnect:
@@ -330,37 +330,11 @@ async def ws_audio_chat_stream(ws: WebSocket):
     qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
     basaa   = MT.to_lg(qwen_fr, "fr")
 
-    # Send reply text first
     try:
         await ws.send_text(json.dumps({"asr": {"text": user_text, "lang": wlang},
                                        "fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
     except Exception:
         await _safe_close(ws); return
 
-    # Stream with lazy header; fallback to WAV if zero chunks
-    chunk_count, q = _stream_once(ws, basaa)
-    if chunk_count > 0:
-        sender_task = asyncio.create_task(_pcm_sender(ws, q))
-        try:
-            try: q.put_nowait(("done", None))
-            except Exception: pass
-            try: q.put_nowait(("stop", None))
-            except Exception: pass
-            try: await asyncio.wait_for(sender_task, timeout=3.0)
-            except Exception: pass
-        finally:
-            try: await ws.send_text("DONE")
-            except Exception: pass
-            await _safe_close(ws)
-        return
-
-    # No chunks → WAV fallback
-    try:
-        wav = TTS.tts(basaa)
-        if wav.size > 0:
-            wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
-            await ws.send_bytes(wav_bytes)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        await _safe_close(ws)
+    await _stream_or_fallback(ws, basaa)
+    await _safe_close(ws)
