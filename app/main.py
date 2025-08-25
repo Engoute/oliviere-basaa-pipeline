@@ -299,3 +299,4 @@ async def ws_translate_stream(ws: WebSocket):
 async def ws_audio_chat_stream(ws: WebSocket):
     # identical to /ws/audio_chat, kept for client compatibility
     await ws_audio_chat(ws)
+ 
