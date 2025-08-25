@@ -18,7 +18,6 @@ RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 # App code
 COPY app/ ./app/
 COPY bootstrap.py ./bootstrap.py
-# COPY README.md ./README.md  # (optional)
 
 # Cache / models env
 ENV HF_HOME=/data/cache/hf \
@@ -26,14 +25,23 @@ ENV HF_HOME=/data/cache/hf \
     HOST=0.0.0.0 \
     PORT=7860
 
-# Model roots & bundles
+# ===== Models (paths + bundles) =====
 ENV MODELS_DIR=/data/models
-ENV PATH_WHISPER=$MODELS_DIR/whisper_hf
-ENV BUNDLE_WHISPER_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/whisper_hf_bundle_20250821_070627.zip"
 
-# NEW: Orpheus bundle URL (set yours here)
-ENV PATH_ORPHEUS=$MODELS_DIR/orpheus_bundle \
-    BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/orpheus_bundle_20250817_155147.zip"
+# Basaa-finetuned Whisper (existing)
+ENV PATH_WHISPER_BASAA=$MODELS_DIR/whisper_hf
+ENV BUNDLE_WHISPER_BASAA_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/whisper_hf_bundle_20250821_070627.zip"
+
+# NEW: Whisper v3 (general) — the ZIP you uploaded
+ENV PATH_WHISPER_GENERAL=$MODELS_DIR/whisper_general
+ENV BUNDLE_WHISPER_GENERAL_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/asr/whisper_v3_general_20250825_223803.zip"
+
+# Orpheus bundle
+ENV PATH_ORPHEUS=$MODELS_DIR/orpheus_bundle
+ENV BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/orpheus_bundle_20250817_155147.zip"
+
+# (Optional) keep compatibility var for legacy code
+ENV PATH_WHISPER=$PATH_WHISPER_BASAA
 
 EXPOSE 7860
 
