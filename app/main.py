@@ -21,7 +21,7 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.91")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.92")
 
 # ---- model singletons --------------------------------------------------------
 print(f"[main] Initializing models…")
@@ -56,8 +56,10 @@ def _normalize_tts_text(text: str) -> str:
     kept = []
     for ch in text:
         cat = unicodedata.category(ch)
-        if cat[0] in ("L","M","N"): kept.append(ch); continue
-        if ch in " .,!?:;'\"-()[]/\\\n\r\t": kept.append(ch)
+        if cat and cat[0] in ("L", "M", "N"):
+            kept.append(ch); continue
+        if ch in " .,!?:;'\"-()[]/\\\n\r\t":
+            kept.append(ch)
     s = "".join(kept)
     s = re.sub(r"\s+", " ", s).strip()
     if s and s[-1] not in ".!?": s += "."
@@ -67,14 +69,14 @@ def _split_for_tts(text: str, max_len: int = 240) -> list[str]:
     # sentence-ish split, then soft-wrap to max_len
     if not text: return []
     pieces = re.split(r"(?<=[\.\!\?])\s+", text)
-    out = []
+    out: list[str] = []
     for p in pieces:
         p = p.strip()
         if not p: continue
         if len(p) <= max_len:
             out.append(p); continue
-        # soft wrap on commas/spaces
-        cur = []
+        # soft wrap on whitespace
+        cur: list[str] = []
         for tok in re.split(r"(\s+)", p):
             if sum(len(x) for x in cur) + len(tok) > max_len and cur:
                 out.append("".join(cur).strip())
@@ -91,10 +93,10 @@ def _is_bad_wave(w: np.ndarray) -> bool:
     if not np.all(np.isfinite(w)):
         return True
     # absurdly short (e.g., stuck)
-    if w.shape[0] < int(0.1 * S.tts_sr):
+    if w.shape[0] < int(0.10 * S.tts_sr):  # <100ms
         return True
-    # almost-DC or tiny variance
-    if np.std(w) < 1e-5:
+    # almost-DC or tiny variance → likely bad
+    if float(np.std(w)) < 1e-5:
         return True
     return False
 
@@ -111,31 +113,35 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
     if not chunks:
         return np.zeros(int(0.3 * S.tts_sr), dtype=np.float32)
 
-    waves = []
+    waves: list[np.ndarray] = []
     for chunk in chunks:
         wav = None
         try:
-            wav = TTS.tts(chunk)  # returns float32 mono @ S.tts_sr
+            wav = TTS.tts(chunk)  # float32 mono @ S.tts_sr
         except Exception:
             wav = None
+
         if _is_bad_wave(wav):
-            # retry with more simplified text (strip punctuation)
+            # retry with simplified text (strip non-word/punct, collapse spaces)
             simple = re.sub(r"[^A-Za-zÀ-ÿ0-9\s]", "", chunk)
             simple = re.sub(r"\s+", " ", simple).strip()
             try:
                 wav = TTS.tts(simple)
             except Exception:
                 wav = None
+
         if _is_bad_wave(wav):
-            # fallback: 200ms silence for this chunk
+            # fallback: ~200ms silence for this chunk
             wav = np.zeros(int(0.2 * S.tts_sr), dtype=np.float32)
+
         waves.append(wav.astype(np.float32, copy=False))
 
-    out = np.concatenate(waves, dtype=np.float32)
+    out = np.concatenate(waves, dtype=np.float32) if waves else np.zeros(0, dtype=np.float32)
     # light limiter
-    peak = np.max(np.abs(out)) if out.size else 0.0
-    if peak > 0.99:
-        out = out * (0.99 / peak)
+    if out.size:
+        peak = float(np.max(np.abs(out)))
+        if peak > 0.99:
+            out = out * (0.99 / peak)
     return out
 
 # ------------------------------------------------------------------------------
@@ -148,12 +154,11 @@ def healthz():
 async def ws_translate_text(ws: WebSocket):
     await ws.accept()
     try:
-        # raw text payload
         text = (await ws.receive_text()).strip()
         is_basaa = _looks_basaa(text)
         out_fr = MT.to_fr(text, "lg") if is_basaa else text
         out_lg = text if is_basaa else MT.to_lg(text, "fr")
-        # Basaa-only for the app UI, BUT keep JSON for future use
+        # Basaa-only is what the app shows; JSON keeps future-flexibility.
         await ws.send_text(json.dumps({"fr": out_fr, "lg": out_lg}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
@@ -167,7 +172,6 @@ async def ws_chat_text(ws: WebSocket):
         user_text = (await ws.receive_text()).strip()
         qwen_fr = QWEN.chat_fr(user_text, temperature=0.2)
         basaa   = MT.to_lg(qwen_fr, "fr")
-        # Basaa-only for the UI, JSON for compatibility
         await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
@@ -182,7 +186,11 @@ async def ws_tts_once(ws: WebSocket):
         text = (await ws.receive_text()).strip()
         wav = synthesize_wav_safe(text)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
-        await ws.send_bytes(wav_bytes)
+        try:
+            await ws.send_bytes(wav_bytes)
+        except Exception:
+            # client might have closed quickly; ignore
+            pass
     except Exception:
         traceback.print_exc()
     finally:
@@ -227,7 +235,10 @@ async def ws_translate(ws: WebSocket):
     try:
         wav = synthesize_wav_safe(lg_text)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
-        await ws.send_bytes(wav_bytes)
+        try:
+            await ws.send_bytes(wav_bytes)
+        except Exception:
+            pass
     except Exception:
         traceback.print_exc()
     finally:
@@ -269,13 +280,16 @@ async def ws_audio_chat(ws: WebSocket):
     try:
         wav = synthesize_wav_safe(basaa)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
-        await ws.send_bytes(wav_bytes)
+        try:
+            await ws.send_bytes(wav_bytes)
+        except Exception:
+            pass
     except Exception:
         traceback.print_exc()
     finally:
         await _safe_close(ws)
 
-# -------------------- "streaming" endpoints now also send full WAV -------------
+# -------------------- "streaming" endpoints now send a full WAV ----------------
 @app.websocket("/ws/translate_stream")
 async def ws_translate_stream(ws: WebSocket):
     # identical to /ws/translate, kept for client compatibility
