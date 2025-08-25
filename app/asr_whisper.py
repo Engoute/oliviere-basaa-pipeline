@@ -1,25 +1,11 @@
 # FILE: app/asr_whisper.py
 from __future__ import annotations
 from pathlib import Path
+from typing import Optional, Tuple
 import numpy as np
 import torch
-
-try:
-    from transformers import (
-        WhisperForConditionalGeneration,
-        WhisperProcessor,
-        WhisperTokenizer,
-        WhisperFeatureExtractor,
-    )
-    _NATIVE = True
-except Exception:
-    from transformers import (
-        AutoModelForSpeechSeq2Seq as WhisperForConditionalGeneration,
-        AutoTokenizer as WhisperTokenizer,
-        AutoFeatureExtractor as WhisperFeatureExtractor,
-    )
-    WhisperProcessor = None  # type: ignore
-    _NATIVE = False
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from .utils_audio import decode_audio_to_16k_float_mono
 
 __all__ = ["ASR"]
 
@@ -32,7 +18,7 @@ def _is_hf_dir(d: Path) -> bool:
         or (d / "tokenizer_config.json").exists()
     )
 
-def _resolve_hf_dir(base: Path) -> Path | None:
+def _resolve_hf_dir(base: Path) -> Optional[Path]:
     if _is_hf_dir(base):
         return base
     best, score = None, -1
@@ -44,141 +30,146 @@ def _resolve_hf_dir(base: Path) -> Path | None:
             best, score = d, s
     return best
 
-def _try_load_tokenizer(use: Path):
-    attempts = [
-        dict(subfolder="processor", use_fast=False),
-        dict(subfolder=None,        use_fast=False),
-        dict(subfolder="processor", use_fast=True),
-        dict(subfolder=None,        use_fast=True),
-    ]
-    errors = []
-    for a in attempts:
-        try:
-            if a["subfolder"]:
-                tok = WhisperTokenizer.from_pretrained(
-                    str(use), subfolder=a["subfolder"], local_files_only=True, use_fast=a["use_fast"]
-                )
-            else:
-                tok = WhisperTokenizer.from_pretrained(
-                    str(use), local_files_only=True, use_fast=a["use_fast"]
-                )
-            return tok
-        except Exception as e:
-            errors.append((a, repr(e)))
-    raise RuntimeError(f"[asr] WhisperTokenizer load failed at {use}. Attempts={attempts}. Errors={errors}")
-
-def _try_load_feature_extractor(use: Path):
-    for sub in ("processor", None):
-        try:
-            if sub:
-                return WhisperFeatureExtractor.from_pretrained(str(use), subfolder=sub, local_files_only=True)
-            return WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
-        except Exception:
-            pass
-    raise RuntimeError(f"[asr] WhisperFeatureExtractor not found under {use} (processor/ or root).")
-
-class ASR:
-    def __init__(self, base_path: str | None):
-        print("[asr] importing app.asr_whisper…")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
-
-        candidates = [Path("/data/models/whisper_hf_resolved")]
-        if base_path:
-            candidates.append(Path(base_path))
-
-        use = None
-        for c in candidates:
-            if c.exists():
-                d = _resolve_hf_dir(c)
-                if d is not None:
-                    use = d; break
-        if use is None:
-            raise RuntimeError(f"HF Whisper not found. Tried: {candidates}")
-
-        self.tok  = _try_load_tokenizer(use)
-        self.feat = _try_load_feature_extractor(use)
-
-        self.hf = WhisperForConditionalGeneration.from_pretrained(
+class _Core:
+    def __init__(self, root: Path, device: str, dtype: torch.dtype):
+        use = _resolve_hf_dir(root) or root
+        self.proc  = AutoProcessor.from_pretrained(str(use), local_files_only=True, trust_remote_code=True)
+        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
             str(use),
             local_files_only=True,
-            torch_dtype=self.dtype,
+            torch_dtype=dtype,
             low_cpu_mem_usage=True,
-        ).to(self.device).eval()
+            trust_remote_code=True,
+        ).to(device).eval()
+        self.device = device
 
+        # Build language token id map if tokenizer exposes them
         self.lang_to_id = {}
-        for code in (
-            "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
-            "is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa pl ps pt ro ru sa sd si sk sl sn so "
-            "sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo zh yue lg bas basaa"
-        ).split():
-            tid = self.tok.convert_tokens_to_ids(f"<|{code}|>")
-            if isinstance(tid, int) and tid >= 0:
-                self.lang_to_id[code] = tid
+        tok = getattr(self.proc, "tokenizer", None)
+        if tok is not None:
+            for code in (
+                "af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha he hi hr ht hu hy id "
+                "is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa pl ps pt ro ru sa sd si sk sl sn so "
+                "sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo zh yue lg bas basaa"
+            ).split():
+                tid = tok.convert_tokens_to_ids(f"<|{code}|>")
+                if isinstance(tid, int) and tid >= 0:
+                    self.lang_to_id[code] = tid
 
-        print(f"[asr] HF Whisper ready at: {use}")
+        # basic token ids for prompt forcing
+        self._sot  = tok.convert_tokens_to_ids("<|startoftranscript|>") if tok else None
+        self._not  = tok.convert_tokens_to_ids("<|notimestamps|>") if tok else None
+        self._task = tok.convert_tokens_to_ids("<|transcribe|>") if tok else None
+        self.tok = tok
 
-    @staticmethod
-    def _pcm16_to_float(wav16k: bytes) -> np.ndarray:
-        return (np.frombuffer(wav16k, dtype=np.int16).astype(np.float32) / 32768.0)
-
-    def _detect_lang(self, feats):
-        if not self.lang_to_id:
+    def _detect_lang(self, feats) -> Tuple[str, float]:
+        if not self.lang_to_id or self._sot is None or self._not is None:
             return "unk", 0.0
-        sot  = self.tok.convert_tokens_to_ids("<|startoftranscript|>")
-        nots = self.tok.convert_tokens_to_ids("<|notimestamps|>")
-        dec  = torch.tensor([[sot, nots]], device=self.device, dtype=torch.long)
+        dec = torch.tensor([[self._sot, self._not]], device=self.model.device, dtype=torch.long)
         with torch.inference_mode():
-            out   = self.hf(input_features=feats, decoder_input_ids=dec)
+            out   = self.model(input_features=feats, decoder_input_ids=dec)
             probs = torch.softmax(out.logits[:, -1, :], dim=-1)[0]
         code, tid = max(self.lang_to_id.items(), key=lambda kv: float(probs[kv[1]].item()))
         return code, float(probs[tid].item())
 
-    def transcribe(self, wav16k: bytes):
-        pcm = self._pcm16_to_float(wav16k)
+    def transcribe(self, wav16k: np.ndarray, lang_hint: Optional[str] = None) -> Tuple[str, str, float]:
+        # Prepare features with processor
+        inputs = self.proc(wav16k, sampling_rate=16000, return_tensors="pt")
+        feats = inputs["input_features"].to(self.model.device, dtype=self.model.dtype)
 
-        # HF 4.45 expects raw_speech=…, older variants accepted audio=…
+        # Decide language token forcing
+        forced_ids = None
+        if self.tok is not None and self._sot is not None and self._task is not None and self._not is not None:
+            lang_tok = None
+            if lang_hint:
+                hint = lang_hint.lower()
+                if hint in BASAA_ALIASES: hint = "lg"
+                if hint in self.lang_to_id:
+                    lang_tok = self.lang_to_id[hint]
+            if lang_tok is None:
+                code, _ = self._detect_lang(feats)
+                if code in self.lang_to_id:
+                    lang_tok = self.lang_to_id[code]
+            if lang_tok is not None:
+                forced_ids = [(0, self._sot), (1, lang_tok), (2, self._task), (3, self._not)]
+            else:
+                forced_ids = [(0, self._sot), (1, self._task), (2, self._not)]
+
         try:
-            feats = (self.feat(raw_speech=pcm, sampling_rate=16000, return_tensors="pt")
-                     .input_features.to(self.device).to(self.hf.dtype))
-        except TypeError:
-            feats = (self.feat(audio=pcm, sampling_rate=16000, return_tensors="pt")   # fallback
-                     .input_features.to(self.device).to(self.hf.dtype))
-
-        code, conf = self._detect_lang(feats)
-
-        def _forced_ids(lang_code: str | None):
-            ids, pos = [], 0
-            for tok in [
-                "<|startoftranscript|>",
-                (f"<|{lang_code}|>" if (lang_code and self.tok.convert_tokens_to_ids(f"<|{lang_code}|>") != self.tok.unk_token_id) else None),
-                "<|transcribe|>", "<|notimestamps|>",
-            ]:
-                if tok is None: continue
-                tid = self.tok.convert_tokens_to_ids(tok)
-                if isinstance(tid, int) and tid >= 0:
-                    ids.append((pos, tid)); pos += 1
-            return ids or None
-
-        forced = _forced_ids(code if code != "unk" else None)
-        try:
-            self.hf.generation_config.forced_decoder_ids = forced
+            self.model.generation_config.forced_decoder_ids = forced_ids
         except Exception:
-            self.hf.generation_config.forced_decoder_ids = None
+            pass
 
-        max_target = int(getattr(self.hf.config, "max_target_positions", 448) or 448)
-        forced_len = len(forced) if forced else 2
-        safe_new   = max(1, min(400, max_target - forced_len - 1))
-
+        max_new = 256
         with torch.inference_mode():
-            out = self.hf.generate(
+            out = self.model.generate(
                 feats,
                 do_sample=False, num_beams=1,
-                max_new_tokens=safe_new,
-                pad_token_id=self.tok.eos_token_id,
-                eos_token_id=self.tok.eos_token_id,
+                max_new_tokens=max_new,
                 early_stopping=True,
             )
-        text = self.tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+        text = self.proc.batch_decode(out, skip_special_tokens=True)[0].strip()
+
+        # best-effort lang code
+        code, conf = self._detect_lang(feats)
         code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
+        return text, code, conf
+
+class ASR:
+    """
+    Dual ASR router:
+      - Basaa-finetuned Whisper for 'lg'
+      - Whisper v3 (general) for fr/en/others
+    """
+    def __init__(self, path_basaa: str | None, path_general: str | None = None):
+        print("[asr] importing app.asr_whisper (dual)…")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
+
+        self.core_basaa: Optional[_Core] = None
+        self.core_general: Optional[_Core] = None
+
+        # discover paths (also check symlinks created by bootstrap)
+        cands_basaa = [Path(p) for p in (
+            path_basaa or "",
+            "/data/models/whisper_basaa_resolved",
+            "/data/models/whisper_hf_resolved",
+        ) if p]
+        for p in cands_basaa:
+            if Path(p).exists():
+                try:
+                    self.core_basaa = _Core(Path(p), self.device, self.dtype)
+                    print(f"[asr] Basaa core loaded from: {p}")
+                    break
+                except Exception as e:
+                    print(f"[asr] WARN: could not load Basaa core at {p}: {e}")
+
+        cands_gen = [Path(p) for p in (
+            path_general or "",
+            "/data/models/whisper_general_resolved",
+        ) if p]
+        for p in cands_gen:
+            if Path(p).exists():
+                try:
+                    self.core_general = _Core(Path(p), self.device, self.dtype)
+                    print(f"[asr] General core loaded from: {p}")
+                    break
+                except Exception as e:
+                    print(f"[asr] WARN: could not load General core at {p}: {e}")
+
+        if not self.core_basaa and not self.core_general:
+            raise RuntimeError("No ASR cores available. Check Whisper bundles on disk.")
+
+    def transcribe(self, audio_bytes: bytes, lang_hint: Optional[str] = None):
+        """
+        Accepts arbitrary WAV/MP3/PCM16 bytes, decodes → 16k mono float32,
+        routes to the appropriate core using lang_hint.
+        """
+        wav16 = decode_audio_to_16k_float_mono(audio_bytes)
+
+        hint = (lang_hint or "").lower().strip()
+        use_basaa = (hint in BASAA_ALIASES) and (self.core_basaa is not None)
+        core = self.core_basaa if use_basaa else (self.core_general or self.core_basaa)
+
+        text, code, conf = core.transcribe(wav16, lang_hint=hint or None)
         return text, code, conf
