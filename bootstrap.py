@@ -13,10 +13,6 @@ def _have_any(p: Path) -> bool:
         return False
 
 def _ensure_dir_path(p: Path) -> Path:
-    """
-    If 'p' is a file (e.g., .../tokenizer.json), return its parent directory.
-    Otherwise return 'p' unchanged.
-    """
     try:
         if p.is_file():
             print(f"[bootstrap] NOTE: path points to a FILE, using its parent: {p} -> {p.parent}")
@@ -26,6 +22,8 @@ def _ensure_dir_path(p: Path) -> Path:
     return p
 
 def _fetch_and_unzip(url: str, target: Path):
+    if not url:
+        return
     # handle accidental symlink path
     if target.exists() and target.is_symlink():
         try:
@@ -78,7 +76,6 @@ def _patch_config_json(root: Path):
         if isinstance(gcfg, dict):
             if gcfg.get("early_stopping", None) is None:
                 gcfg["early_stopping"] = True; changed = True
-            # drop other None values to avoid validate() errors
             for k in list(gcfg.keys()):
                 if k != "early_stopping" and gcfg[k] is None:
                     del gcfg[k]; changed = True
@@ -109,20 +106,11 @@ def _resolve_whisper_hf_dir(base: Path) -> Optional[Path]:
     return best
 
 def _resolve_orpheus_acoustic(base: Path) -> Optional[Path]:
-    """
-    Choose dir that has:
-      • config.json
-      • tokenizer.json
-      • weights: model.safetensors or model-*.safetensors
-    """
     base = _ensure_dir_path(base)
-    # direct hit
     if (base / "config.json").exists() and (base / "tokenizer.json").exists() and (
         (base / "model.safetensors").exists() or any(base.glob("model-*.safetensors"))
     ):
         return base
-
-    # search
     candidates = []
     for cfg in base.rglob("config.json"):
         d = cfg.parent
@@ -131,21 +119,17 @@ def _resolve_orpheus_acoustic(base: Path) -> Optional[Path]:
         if tok and wt:
             candidates.append(d)
     if candidates:
-        candidates.sort(key=lambda p: len(str(p)))  # prefer shallower path
+        candidates.sort(key=lambda p: len(str(p)))
         return candidates[0]
-
-    # last resort: accept base if it at least has tokenizer.json
     return base if (base / "tokenizer.json").exists() else None
 
 def _find_vocoder_dir(base: Path) -> Optional[Path]:
     base = _ensure_dir_path(base)
-    # prefer a folder literally named "vocoder" with valid assets
     for d in base.rglob("vocoder"):
         if (d / "config.json").exists() and (
             (d / "pytorch_model.bin").exists() or any(d.glob("*.safetensors"))
         ):
             return d
-    # fallback: any folder with vocoder-like assets
     for d in base.rglob("config.json"):
         vd = d.parent
         if "vocoder" in str(vd).lower() and (
@@ -170,41 +154,54 @@ def _mk_symlink(name: str, target_dir: Path):
 
 # ---------- main ----------
 def main():
-    whisper_url  = os.environ.get("BUNDLE_WHISPER_URL", "")
-    path_whisper = Path(os.environ.get("PATH_WHISPER",  str(MODELS_DIR / "whisper_hf")))
+    # Basaa Whisper (finetuned)
+    basaa_url  = os.environ.get("BUNDLE_WHISPER_BASAA_URL", "")
+    path_basaa = Path(os.environ.get("PATH_WHISPER_BASAA", str(MODELS_DIR / "whisper_hf")))
+
+    # Whisper v3 general (Distil-Large-v3 zipped)
+    general_url  = os.environ.get("BUNDLE_WHISPER_GENERAL_URL", "")
+    path_general = Path(os.environ.get("PATH_WHISPER_GENERAL", str(MODELS_DIR / "whisper_general")))
 
     m2m_url      = os.environ.get("BUNDLE_M2M_URL", "")
     path_m2m     = Path(os.environ.get("PATH_M2M",     str(MODELS_DIR / "m2m100_1p2B")))
 
     orpheus_url  = os.environ.get("BUNDLE_ORPHEUS_URL", "")
-    path_orpheus = Path(os.environ.get("PATH_ORPHEUS", str(MODELS_DIR / "orpheus_3b")))
+    path_orpheus = Path(os.environ.get("PATH_ORPHEUS", str(MODELS_DIR / "orpheus_bundle")))
 
     qwen_url     = os.environ.get("BUNDLE_QWEN_URL", "")
     path_qwen    = Path(os.environ.get("PATH_QWEN",    str(MODELS_DIR / "qwen2_5_instruct_7b")))
 
     # Normalize any accidental FILE paths to their parent DIRs
-    path_whisper = _ensure_dir_path(path_whisper)
+    path_basaa  = _ensure_dir_path(path_basaa)
+    path_general = _ensure_dir_path(path_general)
     path_m2m     = _ensure_dir_path(path_m2m)
     path_orpheus = _ensure_dir_path(path_orpheus)
     path_qwen    = _ensure_dir_path(path_qwen)
 
-    # Whisper
-    print(f"[bootstrap] PATH_WHISPER = {path_whisper}")
-    if whisper_url: _fetch_and_unzip(whisper_url, path_whisper)
-    wh_real = _resolve_whisper_hf_dir(path_whisper) or path_whisper
-    _mk_symlink("whisper_hf_resolved", wh_real)
-    print(f"[bootstrap] Whisper HF resolved -> {wh_real}")
+    # ----- Whisper Basaa -----
+    print(f"[bootstrap] PATH_WHISPER_BASAA = {path_basaa}")
+    if basaa_url: _fetch_and_unzip(basaa_url, path_basaa)
+    basaa_real = _resolve_whisper_hf_dir(path_basaa) or path_basaa
+    _mk_symlink("whisper_hf_resolved", basaa_real)   # keep old link name
+    _mk_symlink("whisper_basaa_resolved", basaa_real)
+    print(f"[bootstrap] Whisper Basaa resolved -> {basaa_real}")
 
-    # M2M
+    # ----- Whisper General -----
+    print(f"[bootstrap] PATH_WHISPER_GENERAL = {path_general}")
+    if general_url: _fetch_and_unzip(general_url, path_general)
+    general_real = _resolve_whisper_hf_dir(path_general) or path_general
+    _mk_symlink("whisper_general_resolved", general_real)
+    print(f"[bootstrap] Whisper General resolved -> {general_real}")
+
+    # ----- M2M -----
     print(f"[bootstrap] PATH_M2M = {path_m2m}")
     if m2m_url: _fetch_and_unzip(m2m_url, path_m2m)
 
-    # Orpheus
+    # ----- Orpheus -----
     print(f"[bootstrap] PATH_ORPHEUS = {path_orpheus}")
     if orpheus_url: _fetch_and_unzip(orpheus_url, path_orpheus)
     ac_dir = _resolve_orpheus_acoustic(path_orpheus)
     if ac_dir:
-        # Keep your original symlink AND add a generic one for future-proofing
         _mk_symlink("orpheus_3b_resolved", ac_dir)
         _mk_symlink("orpheus_resolved", ac_dir)
         print(f"[bootstrap] Orpheus acoustic resolved -> {ac_dir}")
@@ -216,15 +213,14 @@ def main():
     else:
         print(f"[bootstrap] WARN: Orpheus vocoder not found under {path_orpheus}")
 
-    # Qwen
+    # ----- Qwen -----
     print(f"[bootstrap] PATH_QWEN = {path_qwen}")
     if qwen_url: _fetch_and_unzip(qwen_url, path_qwen)
 
-    # Sanitize generation config problems (files + embedded)
-    for root in [path_whisper, path_m2m, path_orpheus, path_qwen, MODELS_DIR]:
+    # Sanitize generation config problems
+    for root in [path_basaa, path_general, path_m2m, path_orpheus, path_qwen, MODELS_DIR]:
         _disable_generation_configs(root)
-    _patch_config_json(path_m2m)
-    _patch_config_json(path_qwen)
+    _patch_config_json(path_m2m); _patch_config_json(path_qwen)
     if ac_dir: _patch_config_json(ac_dir)
 
     # sanity for M2M
