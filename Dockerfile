@@ -45,7 +45,7 @@ ENV BUNDLE_WHISPER_GENERAL_URL="https://huggingface.co/datasets/LeMisterIA/basaa
 
 # Orpheus bundle
 ENV PATH_ORPHEUS=$MODELS_DIR/orpheus_bundle
-ENV BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/orpheus_bundle_20250817_155147.zip"
+ENV BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/orpheus_bundle_20250825_073332.zip"
 
 # M2M-100 + Qwen (paths usually pre-mounted; bundle URLs optional)
 ENV PATH_M2M=$MODELS_DIR/m2m100_1p2B
