@@ -264,4 +264,5 @@ class ASR:
         use_basaa = (hint in BASAA_ALIASES) and (self.core_basaa is not None)
         core = self.core_basaa if use_basaa else (self.core_general or self.core_basaa)
         text, code, conf = core.transcribe(wav16, lang_hint=hint or None)
-        return text, code, conf
+        # Echo back the user-chosen hint when provided so downstream uses the intended language
+        return text, (hint or code), conf
