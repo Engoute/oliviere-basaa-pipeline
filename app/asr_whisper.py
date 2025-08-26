@@ -5,7 +5,36 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-from .utils_audio import decode_audio_to_16k_float_mono
+
+# Try to use the project's decoder; fall back to a local implementation if absent.
+try:
+    from .utils_audio import decode_audio_to_16k_float_mono  # type: ignore
+except Exception:
+    # Minimal fallback: decode with torchaudio or soundfile; last resort: assume PCM16 mono 16k.
+    def decode_audio_to_16k_float_mono(payload: bytes) -> np.ndarray:  # type: ignore
+        try:
+            import io, torchaudio  # noqa: F401
+            buf = io.BytesIO(payload)
+            wav, sr = torchaudio.load(buf)  # [C,T], float32 in [-1,1] or int
+            if sr != 16000:
+                wav = torchaudio.functional.resample(wav, sr, 16000)
+            if wav.ndim == 2 and wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            return wav.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        except Exception:
+            try:
+                import io, soundfile as sf  # type: ignore
+                buf = io.BytesIO(payload)
+                audio, sr = sf.read(buf, dtype="float32", always_2d=True)
+                if sr != 16000:
+                    import librosa  # type: ignore
+                    audio = librosa.resample(audio.T, orig_sr=sr, target_sr=16000).T
+                mono = audio.mean(axis=1).astype(np.float32, copy=False)
+                return mono
+            except Exception:
+                # last resort: trust raw PCM16 mono @16k
+                x = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+                return x
 
 __all__ = ["ASR"]
 
@@ -29,6 +58,18 @@ def _resolve_hf_dir(base: Path) -> Optional[Path]:
         if s > score:
             best, score = d, s
     return best
+
+def _safe_max_new_tokens(model) -> int:
+    """Pick a conservative max_new_tokens from model config, avoiding truncation."""
+    try:
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            mtp = int(getattr(cfg, "max_target_positions", 448) or 448)
+            # Reserve a handful for forced ids and EOS
+            return max(32, min(400, mtp - 8))
+    except Exception:
+        pass
+    return 256
 
 class _Core:
     def __init__(self, root: Path, device: str, dtype: torch.dtype):
@@ -57,10 +98,10 @@ class _Core:
                     self.lang_to_id[code] = tid
 
         # basic token ids for prompt forcing
+        self._tok  = tok
         self._sot  = tok.convert_tokens_to_ids("<|startoftranscript|>") if tok else None
         self._not  = tok.convert_tokens_to_ids("<|notimestamps|>") if tok else None
         self._task = tok.convert_tokens_to_ids("<|transcribe|>") if tok else None
-        self.tok = tok
 
     def _detect_lang(self, feats) -> Tuple[str, float]:
         if not self.lang_to_id or self._sot is None or self._not is None:
@@ -79,7 +120,7 @@ class _Core:
 
         # Decide language token forcing
         forced_ids = None
-        if self.tok is not None and self._sot is not None and self._task is not None and self._not is not None:
+        if self._tok is not None and None not in (self._sot, self._task, self._not):
             lang_tok = None
             if lang_hint:
                 hint = lang_hint.lower()
@@ -100,7 +141,7 @@ class _Core:
         except Exception:
             pass
 
-        max_new = 256
+        max_new = _safe_max_new_tokens(self.model)
         with torch.inference_mode():
             out = self.model.generate(
                 feats,
@@ -120,47 +161,76 @@ class ASR:
     Dual ASR router:
       - Basaa-finetuned Whisper for 'lg'
       - Whisper v3 (general) for fr/en/others
+
+    Usage patterns supported:
+      • ASR(path_basaa, path_general)             → dual-core
+      • ASR(path_only, role='basaa'|'general')    → single-core, labeled
+      • ASR(path_only)                            → single-core; used for either role
     """
-    def __init__(self, path_basaa: str | None, path_general: str | None = None):
-        print("[asr] importing app.asr_whisper (dual)…")
+    def __init__(
+        self,
+        path_basaa: Optional[str] = None,
+        path_general: Optional[str] = None,
+        role: Optional[str] = None,   # 'basaa' | 'general' | None
+    ):
+        print("[asr] importing app.asr_whisper (dual-capable)…")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
         self.core_basaa: Optional[_Core] = None
         self.core_general: Optional[_Core] = None
 
-        # discover paths (also check symlinks created by bootstrap)
-        cands_basaa = [Path(p) for p in (
-            path_basaa or "",
-            "/data/models/whisper_basaa_resolved",
-            "/data/models/whisper_hf_resolved",
-        ) if p]
-        for p in cands_basaa:
-            if Path(p).exists():
-                try:
-                    self.core_basaa = _Core(Path(p), self.device, self.dtype)
+        # Prefer explicit paths; then known symlinks from bootstrap.
+        exp_basaa   = [p for p in [path_basaa, "/data/models/whisper_basaa_resolved", "/data/models/whisper_hf_resolved"] if p]
+        exp_general = [p for p in [path_general, "/data/models/whisper_general_resolved"] if p]
+
+        def _try_load(where: str) -> Optional[_Core]:
+            p = Path(where)
+            if not p.exists():
+                return None
+            try:
+                core = _Core(p, self.device, self.dtype)
+                return core
+            except Exception as e:
+                print(f"[asr] WARN: could not load core at {where}: {e}")
+                return None
+
+        # Role-aware single path?
+        if role in ("basaa", "general") and path_basaa and not path_general:
+            core = _try_load(path_basaa)
+            if role == "basaa":
+                self.core_basaa = core
+            else:
+                self.core_general = core
+
+        # Normal dual-path loading.
+        if self.core_basaa is None:
+            for p in exp_basaa:
+                core = _try_load(p)
+                if core:
+                    self.core_basaa = core
                     print(f"[asr] Basaa core loaded from: {p}")
                     break
-                except Exception as e:
-                    print(f"[asr] WARN: could not load Basaa core at {p}: {e}")
 
-        cands_gen = [Path(p) for p in (
-            path_general or "",
-            "/data/models/whisper_general_resolved",
-        ) if p]
-        for p in cands_gen:
-            if Path(p).exists():
-                try:
-                    self.core_general = _Core(Path(p), self.device, self.dtype)
+        if self.core_general is None:
+            for p in exp_general:
+                core = _try_load(p)
+                if core:
+                    self.core_general = core
                     print(f"[asr] General core loaded from: {p}")
                     break
-                except Exception as e:
-                    print(f"[asr] WARN: could not load General core at {p}: {e}")
+
+        # If still nothing loaded and we only got a single unspecified path,
+        # load that one as a generic core (usable for any hint).
+        if not self.core_basaa and not self.core_general and path_basaa and not path_general and role is None:
+            core = _try_load(path_basaa)
+            self.core_general = core  # treat as general by default
+            print(f"[asr] Single core loaded (generic): {path_basaa}")
 
         if not self.core_basaa and not self.core_general:
             raise RuntimeError("No ASR cores available. Check Whisper bundles on disk.")
 
-    def transcribe(self, audio_bytes: bytes, lang_hint: Optional[str] = None):
+    def transcribe(self, audio_bytes: bytes, lang_hint: Optional[str] = None) -> Tuple[str, str, float]:
         """
         Accepts arbitrary WAV/MP3/PCM16 bytes, decodes → 16k mono float32,
         routes to the appropriate core using lang_hint.
