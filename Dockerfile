@@ -47,3 +47,6 @@ EXPOSE 7860
 
 # Download/extract bundles, then start API
 CMD python bootstrap.py && python -m uvicorn app.main:app --host $HOST --port $PORT
+
+ENV TRANSFORMERS_NO_TORCHVISION=1
+
