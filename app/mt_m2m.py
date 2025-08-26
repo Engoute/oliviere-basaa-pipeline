@@ -75,27 +75,27 @@ class M2M:
         c = code.lower()
         return _LANG_NORM.get(c, c)
 
-    def resolve_safe_src(self, text: str, whisper_hint: Optional[str]) -> str:
+    def resolve_safe_src(self, text: str, hint_from_client: Optional[str]) -> str:
         """
-        Decide a SAFE source code for M2M:
-        1) Heuristics: Basaa -> 'lg', French -> 'fr', English -> 'en'
-        2) Else: map Whisper hint via _LANG_NORM if valid
-        3) Fallback -> 'fr', then 'en'
+        Decide a SAFE source code for M2M (hint-first):
+        1) If the client provided a hint and the tokenizer supports it -> use it
+        2) Else heuristics: Basaa -> 'lg', French -> 'fr', English -> 'en'
+        3) Fallback -> 'fr', then 'en', then 'lg'
         Always returns a code accepted by self.tok.get_lang_id (or a reasonable fallback).
         """
-        # 1) Heuristics first
+        # 1) Explicit user hint wins if supported
+        h = self._norm(hint_from_client)
+        if h:
+            try:
+                _ = self.tok.get_lang_id(h)  # throws if unsupported
+                return h
+            except Exception:
+                pass
+
+        # 2) Heuristics if no usable hint
         if looks_like_basaa(text): return "lg"
         if looks_like_fr(text):    return "fr"
         if looks_like_en(text):    return "en"
-
-        # 2) Try mapped Whisper hint if present AND supported
-        hint = self._norm(whisper_hint)
-        if hint:
-            try:
-                _ = self.tok.get_lang_id(hint)  # will throw if unsupported
-                return hint
-            except Exception:
-                pass
 
         # 3) Fallbacks
         for cand in ("fr", "en", "lg"):
