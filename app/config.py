@@ -8,15 +8,15 @@ class Settings:
     port: int = int(os.getenv("PORT", "7860"))
 
     # Back-compat (Basaa finetune)
-    path_whisper: str = os.getenv("PATH_WHISPER")  # kept, but see below
+    path_whisper: str = os.getenv("PATH_WHISPER", "")
 
-    # Explicit dual-model paths (Basaa FT + General Whisper v3)
+    # Explicit dual-model paths
     path_whisper_basaa: str = os.getenv("PATH_WHISPER_BASAA", os.getenv("PATH_WHISPER", ""))
     path_whisper_general: str = os.getenv("PATH_WHISPER_GENERAL", "")
 
-    path_m2m: str = os.getenv("PATH_M2M")
-    path_orpheus: str = os.getenv("PATH_ORPHEUS")
-    path_qwen: str = os.getenv("PATH_QWEN")
+    path_m2m: str = os.getenv("PATH_M2M", "")
+    path_orpheus: str = os.getenv("PATH_ORPHEUS", "")
+    path_qwen: str = os.getenv("PATH_QWEN", "")
 
     in_pcm_sr: int = 16000
     tts_sr: int = int(os.getenv("TTS_SR", "24000"))
