@@ -4,11 +4,12 @@ from __future__ import annotations
 from .fast import speed_tweaks
 speed_tweaks()
 
-import asyncio
 import json
 import re
 import unicodedata
 import traceback
+from typing import Optional, Tuple
+
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -21,21 +22,25 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
-app = FastAPI(title="Basaa Realtime Pipeline", version="0.92")
+app = FastAPI(title="Basaa Realtime Pipeline", version="0.95")
 
 # ---- model singletons --------------------------------------------------------
 print(f"[main] Initializing models…")
-print(f"[main]  PATH_WHISPER = {S.path_whisper}")
-ASR_MODEL = ASR(S.path_whisper)
 
-print(f"[main]  PATH_M2M     = {S.path_m2m}")
-MT        = M2M(S.path_m2m)
+print(f"[main]  PATH_WHISPER_BASAA    = {S.path_whisper_basaa or S.path_whisper}")
+ASR_BASAA   = ASR(S.path_whisper_basaa or S.path_whisper)
 
-print(f"[main]  PATH_ORPHEUS  = {S.path_orpheus}")
-TTS       = Orpheus(S.path_orpheus, sr_out=S.tts_sr)
+print(f"[main]  PATH_WHISPER_GENERAL  = {S.path_whisper_general}")
+ASR_GENERAL = ASR(S.path_whisper_general)
 
-print(f"[main]  PATH_QWEN     = {S.path_qwen}")
-QWEN      = QwenAgent(S.path_qwen)
+print(f"[main]  PATH_M2M              = {S.path_m2m}")
+MT   = M2M(S.path_m2m)
+
+print(f"[main]  PATH_ORPHEUS          = {S.path_orpheus}")
+TTS  = Orpheus(S.path_orpheus, sr_out=S.tts_sr)
+
+print(f"[main]  PATH_QWEN             = {S.path_qwen}")
+QWEN = QwenAgent(S.path_qwen)
 
 print(f"[main] Models ready.")
 
@@ -52,7 +57,6 @@ def _looks_basaa(text: str) -> bool:
     return any(c in "ŋɓƁàáâèéêìíîòóôùúûɛɔ" for c in t)
 
 def _normalize_tts_text(text: str) -> str:
-    # keep letters, marks, digits, common punct & space; collapse whitespace; ensure trailing period
     kept = []
     for ch in text:
         cat = unicodedata.category(ch)
@@ -66,7 +70,6 @@ def _normalize_tts_text(text: str) -> str:
     return s
 
 def _split_for_tts(text: str, max_len: int = 240) -> list[str]:
-    # sentence-ish split, then soft-wrap to max_len
     if not text: return []
     pieces = re.split(r"(?<=[\.\!\?])\s+", text)
     out: list[str] = []
@@ -75,39 +78,23 @@ def _split_for_tts(text: str, max_len: int = 240) -> list[str]:
         if not p: continue
         if len(p) <= max_len:
             out.append(p); continue
-        # soft wrap on whitespace
         cur: list[str] = []
         for tok in re.split(r"(\s+)", p):
             if sum(len(x) for x in cur) + len(tok) > max_len and cur:
-                out.append("".join(cur).strip())
-                cur = [tok]
+                out.append("".join(cur).strip()); cur = [tok]
             else:
                 cur.append(tok)
-        if cur:
-            out.append("".join(cur).strip())
+        if cur: out.append("".join(cur).strip())
     return out
 
 def _is_bad_wave(w: np.ndarray) -> bool:
-    if w is None or not isinstance(w, np.ndarray) or w.size == 0:
-        return True
-    if not np.all(np.isfinite(w)):
-        return True
-    # absurdly short (e.g., stuck)
-    if w.shape[0] < int(0.10 * S.tts_sr):  # <100ms
-        return True
-    # almost-DC or tiny variance → likely bad
-    if float(np.std(w)) < 1e-5:
-        return True
+    if w is None or not isinstance(w, np.ndarray) or w.size == 0: return True
+    if not np.all(np.isfinite(w)): return True
+    if w.shape[0] < int(0.10 * S.tts_sr): return True
+    if float(np.std(w)) < 1e-5: return True
     return False
 
 def synthesize_wav_safe(text: str) -> np.ndarray:
-    """
-    Non-streaming, robust synthesis:
-      - normalize & sentence-split
-      - synth each sentence; retry once with simplified text if needed
-      - concat; ensure not crazy loud
-      - fall back to short silence on failure
-    """
     clean = _normalize_tts_text(text)
     chunks = _split_for_tts(clean)
     if not chunks:
@@ -117,12 +104,11 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
     for chunk in chunks:
         wav = None
         try:
-            wav = TTS.tts(chunk)  # float32 mono @ S.tts_sr
+            wav = TTS.tts(chunk)
         except Exception:
             wav = None
 
         if _is_bad_wave(wav):
-            # retry with simplified text (strip non-word/punct, collapse spaces)
             simple = re.sub(r"[^A-Za-zÀ-ÿ0-9\s]", "", chunk)
             simple = re.sub(r"\s+", " ", simple).strip()
             try:
@@ -131,34 +117,59 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
                 wav = None
 
         if _is_bad_wave(wav):
-            # fallback: ~200ms silence for this chunk
             wav = np.zeros(int(0.2 * S.tts_sr), dtype=np.float32)
 
         waves.append(wav.astype(np.float32, copy=False))
 
     out = np.concatenate(waves, dtype=np.float32) if waves else np.zeros(0, dtype=np.float32)
-    # light limiter
     if out.size:
         peak = float(np.max(np.abs(out)))
         if peak > 0.99:
             out = out * (0.99 / peak)
     return out
 
+# ---- JSON helpers ------------------------------------------------------------
+def _try_parse_json(s: str) -> Optional[dict]:
+    s = (s or "").strip()
+    if not s or s[0] not in "{[" or s[-1] not in "}]":
+        return None
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+def _norm_lang(c: Optional[str]) -> Optional[str]:
+    if not c: return None
+    c = c.strip().lower()
+    if c in ("fr", "en", "lg"): return c
+    if c in ("fra", "fr-fr"):   return "fr"
+    if c in ("eng", "en-us", "en-gb"): return "en"
+    if c in ("bas", "basaa"):   return "lg"
+    return None
+
 # ------------------------------------------------------------------------------
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
 
-# -------------------- text endpoints ------------------------------------------
+# -------------------- text endpoints (accept JSON, return BOTH) ---------------
 @app.websocket("/ws/translate_text")
 async def ws_translate_text(ws: WebSocket):
     await ws.accept()
     try:
-        text = (await ws.receive_text()).strip()
-        is_basaa = _looks_basaa(text)
-        out_fr = MT.to_fr(text, "lg") if is_basaa else text
-        out_lg = text if is_basaa else MT.to_lg(text, "fr")
-        # Basaa-only is what the app shows; JSON keeps future-flexibility.
+        raw = (await ws.receive_text()).strip()
+        obj = _try_parse_json(raw)
+        if obj:
+            text = (obj.get("text") or obj.get("t") or "").strip()
+            src_hint = _norm_lang(obj.get("src") or obj.get("lang"))
+        else:
+            text = raw
+            src_hint = None
+
+        src = MT.resolve_safe_src(text, src_hint)
+        out_fr = MT.to_fr(text, src)
+        out_lg = MT.to_lg(text, src)
         await ws.send_text(json.dumps({"fr": out_fr, "lg": out_lg}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
@@ -169,8 +180,24 @@ async def ws_translate_text(ws: WebSocket):
 async def ws_chat_text(ws: WebSocket):
     await ws.accept()
     try:
-        user_text = (await ws.receive_text()).strip()
-        qwen_fr = QWEN.chat_fr(user_text, temperature=0.2)
+        raw = (await ws.receive_text()).strip()
+        obj = _try_parse_json(raw)
+        if obj:
+            user_text = (obj.get("text") or obj.get("t") or "").strip()
+            lang = _norm_lang(obj.get("lang") or obj.get("src")) or ("lg" if _looks_basaa(user_text) else "fr")
+        else:
+            user_text = raw
+            lang = "lg" if _looks_basaa(user_text) else "fr"
+
+        # Normalize to FR for Qwen
+        if lang == "lg":
+            user_fr = MT.to_fr(user_text, "lg")
+        elif lang == "en":
+            user_fr = MT.to_fr(user_text, "en")
+        else:
+            user_fr = user_text
+
+        qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
         basaa   = MT.to_lg(qwen_fr, "fr")
         await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
     except Exception:
@@ -178,61 +205,63 @@ async def ws_chat_text(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
-# -------------------- TTS once (non-streaming WAV) ----------------------------
-@app.websocket("/ws/tts_once")
-async def ws_tts_once(ws: WebSocket):
-    await ws.accept()
-    try:
-        text = (await ws.receive_text()).strip()
-        wav = synthesize_wav_safe(text)
-        wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
-        try:
-            await ws.send_bytes(wav_bytes)
-        except Exception:
-            # client might have closed quickly; ignore
-            pass
-    except Exception:
-        traceback.print_exc()
-    finally:
-        await _safe_close(ws)
-
-# -------------------- legacy non-streaming audio ------------------------------
-@app.websocket("/ws/translate")
-async def ws_translate(ws: WebSocket):
-    await ws.accept()
+# -------------------- audio helpers (header + bytes) --------------------------
+async def _recv_audio_with_lang_header(ws: WebSocket) -> Tuple[bytes, Optional[str]]:
+    """
+    First text frame may be JSON: {"lang":"fr|en|lg"} or {"src": "..."}.
+    Then binary chunks. Finish when client sends "DONE".
+    """
     buf = bytearray()
+    lang_hint: Optional[str] = None
+    first = True
     try:
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
                 if "text" in msg:
-                    if msg["text"] == "DONE":
+                    s = (msg.get("text") or "").strip()
+                    if s == "DONE":
                         break
+                    if first:
+                        obj = _try_parse_json(s)
+                        if obj:
+                            lang_hint = _norm_lang(obj.get("lang") or obj.get("src"))
+                            first = False
+                            continue
+                    # otherwise ignore stray text frames
                 elif "bytes" in msg and msg["bytes"]:
+                    first = False
                     buf.extend(msg["bytes"])
             elif msg["type"] == "websocket.disconnect":
-                return
+                break
     except WebSocketDisconnect:
-        return
+        pass
     except Exception:
-        traceback.print_exc(); await _safe_close(ws); return
+        traceback.print_exc()
+    return bytes(buf), lang_hint
 
-    text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
-    if wlang == "lg":
-        fr_text, lg_text = MT.to_fr(text, "lg"), text
-    else:
-        fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
-        lg_text = MT.to_lg(text, wlang)
+def _choose_asr(lang_hint: Optional[str]) -> ASR:
+    # If user explicitly chooses Basaa, force Basaa FT; else use General v3.
+    return ASR_BASAA if lang_hint == "lg" else ASR_GENERAL
 
-    # send text json first
+# -------------------- legacy non-streaming audio ------------------------------
+@app.websocket("/ws/translate")
+async def ws_translate(ws: WebSocket):
+    await ws.accept()
     try:
+        pcm16, lang_hint = await _recv_audio_with_lang_header(ws)
+        asr = _choose_asr(lang_hint)
+        text, wlang, _ = asr.transcribe(pcm16)
+
+        if wlang == "lg":
+            fr_text, lg_text = MT.to_fr(text, "lg"), text
+        else:
+            fr_text = text if wlang == "fr" else MT.to_fr(text, wlang)
+            lg_text = MT.to_lg(text, wlang)
+
         await ws.send_text(json.dumps({"asr": {"text": text, "lang": wlang},
                                        "fr": fr_text, "lg": lg_text}, ensure_ascii=False))
-    except Exception:
-        await _safe_close(ws); return
 
-    # synth full wav once
-    try:
         wav = synthesize_wav_safe(lg_text)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
         try:
@@ -247,37 +276,24 @@ async def ws_translate(ws: WebSocket):
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(ws: WebSocket):
     await ws.accept()
-    buf = bytearray()
     try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.receive":
-                if "text" in msg:
-                    if msg["text"] == "DONE":
-                        break
-                elif "bytes" in msg and msg["bytes"]:
-                    buf.extend(msg["bytes"])
-            elif msg["type"] == "websocket.disconnect":
-                return
-    except WebSocketDisconnect:
-        return
-    except Exception:
-        traceback.print_exc(); await _safe_close(ws); return
+        pcm16, lang_hint = await _recv_audio_with_lang_header(ws)
+        asr = _choose_asr(lang_hint)
+        user_text, wlang, _ = asr.transcribe(pcm16)
 
-    user_text, wlang, _ = ASR_MODEL.transcribe(bytes(buf))
-    user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
-    qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
-    basaa   = MT.to_lg(qwen_fr, "fr")
+        if wlang == "lg":
+            user_fr = MT.to_fr(user_text, "lg")
+        elif wlang == "en":
+            user_fr = MT.to_fr(user_text, "en")
+        else:
+            user_fr = user_text if wlang == "fr" else MT.to_fr(user_text, wlang)
 
-    # send text first
-    try:
+        qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+        basaa   = MT.to_lg(qwen_fr, "fr")
+
         await ws.send_text(json.dumps({"asr": {"text": user_text, "lang": wlang},
                                        "fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
-    except Exception:
-        await _safe_close(ws); return
 
-    # synth full wav once
-    try:
         wav = synthesize_wav_safe(basaa)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
         try:
@@ -289,14 +305,11 @@ async def ws_audio_chat(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
-# -------------------- "streaming" endpoints now send a full WAV ----------------
+# -------------------- streaming aliases (compat) ------------------------------
 @app.websocket("/ws/translate_stream")
 async def ws_translate_stream(ws: WebSocket):
-    # identical to /ws/translate, kept for client compatibility
     await ws_translate(ws)
 
 @app.websocket("/ws/audio_chat_stream")
 async def ws_audio_chat_stream(ws: WebSocket):
-    # identical to /ws/audio_chat, kept for client compatibility
     await ws_audio_chat(ws)
- 
