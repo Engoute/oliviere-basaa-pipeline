@@ -4,23 +4,22 @@ from pathlib import Path
 from typing import Optional, Tuple
 import os
 
-# 🚫 Prevent transformers from importing torchvision (fixes "operator torchvision::nms does not exist")
+# Block torchvision import entirely (prevents "operator torchvision::nms does not exist")
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 
 import numpy as np
 import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import AutoModelForSpeechSeq2Seq
 
-# Try to use the project's decoder; fall back to a local implementation if absent.
+# Prefer the project decoder; keep a tiny fallback.
 try:
     from .utils_audio import decode_audio_to_16k_float_mono  # type: ignore
 except Exception:
-    # Minimal fallback decoder: torchaudio / soundfile / raw PCM16
     def decode_audio_to_16k_float_mono(payload: bytes) -> np.ndarray:  # type: ignore
         try:
-            import io, torchaudio  # noqa: F401
+            import io, torchaudio
             buf = io.BytesIO(payload)
-            wav, sr = torchaudio.load(buf)  # [C,T]
+            wav, sr = torchaudio.load(buf)
             if sr != 16000:
                 wav = torchaudio.functional.resample(wav, sr, 16000)
             if wav.ndim == 2 and wav.shape[0] > 1:
@@ -28,14 +27,20 @@ except Exception:
             return wav.squeeze(0).detach().cpu().numpy().astype(np.float32)
         except Exception:
             try:
-                import io, soundfile as sf  # type: ignore
+                import io, wave
                 buf = io.BytesIO(payload)
-                audio, sr = sf.read(buf, dtype="float32", always_2d=True)
-                if sr != 16000:
-                    import librosa  # type: ignore
-                    audio = librosa.resample(audio.T, orig_sr=sr, target_sr=16000).T
-                mono = audio.mean(axis=1).astype(np.float32, copy=False)
-                return mono
+                with wave.open(buf, "rb") as w:
+                    nch = w.getnchannels(); sr = w.getframerate(); n = w.getnframes()
+                    sw  = w.getsampwidth(); raw = w.readframes(n)
+                if sw == 2:
+                    x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+                elif sw == 1:
+                    x = (np.frombuffer(raw, dtype="|u1").astype(np.float32) - 128.0) / 128.0
+                else:
+                    x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+                if nch > 1:
+                    x = x.reshape(-1, nch).mean(axis=1)
+                return x.astype(np.float32, copy=False)
             except Exception:
                 x = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
                 return x
@@ -49,6 +54,8 @@ def _is_hf_dir(d: Path) -> bool:
         (d / "processor").exists()
         or (d / "tokenizer.json").exists()
         or (d / "tokenizer_config.json").exists()
+        or (d / "feature_extractor.json").exists()
+        or (d / "preprocessor_config.json").exists()
     )
 
 def _resolve_hf_dir(base: Path) -> Optional[Path]:
@@ -57,8 +64,9 @@ def _resolve_hf_dir(base: Path) -> Optional[Path]:
     best, score = None, -1
     for cfg in base.rglob("config.json"):
         d = cfg.parent
-        s = (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
-            + (1 if (d / "processor").exists() else 0)
+        s = (2 if (d / "preprocessor_config.json").exists() else 0) \
+            + (2 if (d / "tokenizer.json").exists() or (d / "tokenizer_config.json").exists() else 0) \
+            + (1 if (d / "feature_extractor.json").exists() or (d / "processor").exists() else 0)
         if s > score:
             best, score = d, s
     return best
@@ -73,10 +81,44 @@ def _safe_max_new_tokens(model) -> int:
         pass
     return 256
 
+def _build_processor(use: Path, prefer_auto: bool):
+    """
+    prefer_auto=False  -> classic WhisperProcessor only (Basaa-safe)
+    prefer_auto=True   -> try AutoProcessor first, then fall back to classic
+    """
+    # Classic WhisperProcessor loader (root or processor/)
+    def _classic():
+        from transformers import WhisperTokenizer, WhisperFeatureExtractor, WhisperProcessor
+        tok = None; fe = None
+        try:
+            tok = WhisperTokenizer.from_pretrained(str(use), subfolder="processor", local_files_only=True, use_fast=False)
+        except Exception:
+            tok = WhisperTokenizer.from_pretrained(str(use), local_files_only=True, use_fast=False)
+        try:
+            fe = WhisperFeatureExtractor.from_pretrained(str(use), subfolder="processor", local_files_only=True)
+        except Exception:
+            fe = WhisperFeatureExtractor.from_pretrained(str(use), local_files_only=True)
+        return WhisperProcessor(feature_extractor=fe, tokenizer=tok)
+
+    if not prefer_auto:
+        return _classic()
+
+    # AutoProcessor path (needed by v3 general) with fallback
+    try:
+        from transformers import AutoProcessor
+        return AutoProcessor.from_pretrained(str(use), local_files_only=True, trust_remote_code=True)
+    except Exception as e_auto:
+        try:
+            proc = _classic()
+            print(f"[asr] AutoProcessor missing at {use}; using WhisperProcessor fallback.")
+            return proc
+        except Exception as e_fb:
+            raise RuntimeError(f"[asr] Could not build processor at {use}. Auto error: {e_auto}; Fallback error: {e_fb}")
+
 class _Core:
-    def __init__(self, root: Path, device: str, dtype: torch.dtype):
+    def __init__(self, root: Path, device: str, dtype: torch.dtype, prefer_auto: bool):
         use = _resolve_hf_dir(root) or root
-        self.proc  = AutoProcessor.from_pretrained(str(use), local_files_only=True, trust_remote_code=True)
+        self.proc  = _build_processor(use, prefer_auto=prefer_auto)
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
             str(use),
             local_files_only=True,
@@ -157,11 +199,11 @@ class _Core:
 class ASR:
     """
     Dual ASR router:
-      - Basaa-finetuned Whisper for 'lg'
-      - Whisper v3 (general) for fr/en/others
+      - Basaa-finetuned Whisper for 'lg' (classic processor only)
+      - Whisper v3 (general) for fr/en/others (AutoProcessor allowed)
     """
     def __init__(self, path_basaa: Optional[str] = None, path_general: Optional[str] = None, role: Optional[str] = None):
-        print("[asr] importing app.asr_whisper (dual-capable)…")
+        print("[asr] importing app.asr_whisper (dual-capable, basaa-safe)…")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
 
@@ -171,41 +213,45 @@ class ASR:
         exp_basaa   = [p for p in [path_basaa, "/data/models/whisper_basaa_resolved", "/data/models/whisper_hf_resolved"] if p]
         exp_general = [p for p in [path_general, "/data/models/whisper_general_resolved"] if p]
 
-        def _try_load(where: str) -> Optional[_Core]:
+        def _try_load(where: str, prefer_auto: bool) -> Optional[_Core]:
             p = Path(where)
             if not p.exists():
                 return None
             try:
-                return _Core(p, self.device, self.dtype)
+                return _Core(p, self.device, self.dtype, prefer_auto=prefer_auto)
             except Exception as e:
                 print(f"[asr] WARN: could not load core at {where}: {e}")
                 return None
 
+        # Explicit role shortcut (rarely needed)
         if role in ("basaa", "general") and path_basaa and not path_general:
-            core = _try_load(path_basaa)
+            core = _try_load(path_basaa, prefer_auto=(role == "general"))
             if role == "basaa":
                 self.core_basaa = core
             else:
                 self.core_general = core
 
+        # Basaa core: NEVER use AutoProcessor
         if self.core_basaa is None:
             for p in exp_basaa:
-                core = _try_load(p)
+                core = _try_load(p, prefer_auto=False)
                 if core:
                     self.core_basaa = core
                     print(f"[asr] Basaa core loaded from: {p}")
                     break
 
+        # General core: AutoProcessor ok, fallback to classic
         if self.core_general is None:
             for p in exp_general:
-                core = _try_load(p)
+                core = _try_load(p, prefer_auto=True)
                 if core:
                     self.core_general = core
                     print(f"[asr] General core loaded from: {p}")
                     break
 
+        # Single-path fallback
         if not self.core_basaa and not self.core_general and path_basaa and not path_general and role is None:
-            core = _try_load(path_basaa)
+            core = _try_load(path_basaa, prefer_auto=False)
             self.core_general = core
             print(f"[asr] Single core loaded (generic): {path_basaa}")
 
