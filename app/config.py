@@ -10,7 +10,7 @@ class Settings:
     # Back-compat (Basaa finetune)
     path_whisper: str = os.getenv("PATH_WHISPER")  # kept, but see below
 
-    # NEW: explicit dual-model paths
+    # Explicit dual-model paths (Basaa FT + General Whisper v3)
     path_whisper_basaa: str = os.getenv("PATH_WHISPER_BASAA", os.getenv("PATH_WHISPER", ""))
     path_whisper_general: str = os.getenv("PATH_WHISPER_GENERAL", "")
 
