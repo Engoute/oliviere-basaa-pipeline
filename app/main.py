@@ -153,7 +153,7 @@ async def ws_translate_text(ws: WebSocket):
         text = (payload.get("text") or "").strip()
         src_hint = (payload.get("lang") or payload.get("src") or "").strip().lower()
 
-        # Resolve safe src for M2M (falls back sanely)
+        # Resolve safe src for M2M (hint-first, then heuristics/fallback)
         src = MT.resolve_safe_src(text, src_hint or None)
 
         out_fr = MT.to_fr(text, src)
@@ -178,7 +178,7 @@ async def ws_chat_text(ws: WebSocket):
         user_text = (payload.get("text") or "").strip()
         src_hint  = (payload.get("lang") or payload.get("src") or "").strip().lower()
 
-        # Normalize to French for Qwen, then back to Basaa
+        # Normalize to French for Qwen, then back to Basaa (hint-first)
         src     = MT.resolve_safe_src(user_text, src_hint or None)
         user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
         qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
@@ -253,7 +253,8 @@ async def ws_translate(ws: WebSocket):
 
     try:
         text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
-        src = MT.resolve_safe_src(text, wlang or lang_hint)
+        # HINT FIRST: prefer the explicit client hint; fall back to Whisper's detected language
+        src = MT.resolve_safe_src(text, lang_hint or wlang)
 
         fr_text = MT.to_fr(text, src)
         lg_text = MT.to_lg(text, src)
@@ -284,7 +285,8 @@ async def ws_audio_chat(ws: WebSocket):
 
     try:
         user_text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
-        src     = MT.resolve_safe_src(user_text, wlang or lang_hint)
+        # HINT FIRST
+        src     = MT.resolve_safe_src(user_text, lang_hint or wlang)
         user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
 
         qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
