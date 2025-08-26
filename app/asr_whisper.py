@@ -2,6 +2,11 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Tuple
+import os
+
+# 🚫 Prevent transformers from importing torchvision (fixes "operator torchvision::nms does not exist")
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+
 import numpy as np
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
@@ -10,12 +15,12 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 try:
     from .utils_audio import decode_audio_to_16k_float_mono  # type: ignore
 except Exception:
-    # Minimal fallback: decode with torchaudio or soundfile; last resort: assume PCM16 mono 16k.
+    # Minimal fallback decoder: torchaudio / soundfile / raw PCM16
     def decode_audio_to_16k_float_mono(payload: bytes) -> np.ndarray:  # type: ignore
         try:
             import io, torchaudio  # noqa: F401
             buf = io.BytesIO(payload)
-            wav, sr = torchaudio.load(buf)  # [C,T], float32 in [-1,1] or int
+            wav, sr = torchaudio.load(buf)  # [C,T]
             if sr != 16000:
                 wav = torchaudio.functional.resample(wav, sr, 16000)
             if wav.ndim == 2 and wav.shape[0] > 1:
@@ -32,7 +37,6 @@ except Exception:
                 mono = audio.mean(axis=1).astype(np.float32, copy=False)
                 return mono
             except Exception:
-                # last resort: trust raw PCM16 mono @16k
                 x = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
                 return x
 
@@ -60,12 +64,10 @@ def _resolve_hf_dir(base: Path) -> Optional[Path]:
     return best
 
 def _safe_max_new_tokens(model) -> int:
-    """Pick a conservative max_new_tokens from model config, avoiding truncation."""
     try:
         cfg = getattr(model, "config", None)
         if cfg is not None:
             mtp = int(getattr(cfg, "max_target_positions", 448) or 448)
-            # Reserve a handful for forced ids and EOS
             return max(32, min(400, mtp - 8))
     except Exception:
         pass
@@ -97,7 +99,6 @@ class _Core:
                 if isinstance(tid, int) and tid >= 0:
                     self.lang_to_id[code] = tid
 
-        # basic token ids for prompt forcing
         self._tok  = tok
         self._sot  = tok.convert_tokens_to_ids("<|startoftranscript|>") if tok else None
         self._not  = tok.convert_tokens_to_ids("<|notimestamps|>") if tok else None
@@ -114,11 +115,9 @@ class _Core:
         return code, float(probs[tid].item())
 
     def transcribe(self, wav16k: np.ndarray, lang_hint: Optional[str] = None) -> Tuple[str, str, float]:
-        # Prepare features with processor
         inputs = self.proc(wav16k, sampling_rate=16000, return_tensors="pt")
         feats = inputs["input_features"].to(self.model.device, dtype=self.model.dtype)
 
-        # Decide language token forcing
         forced_ids = None
         if self._tok is not None and None not in (self._sot, self._task, self._not):
             lang_tok = None
@@ -151,7 +150,6 @@ class _Core:
             )
         text = self.proc.batch_decode(out, skip_special_tokens=True)[0].strip()
 
-        # best-effort lang code
         code, conf = self._detect_lang(feats)
         code = "lg" if (code or "unk").lower() in BASAA_ALIASES else (code or "unk").lower()
         return text, code, conf
@@ -161,18 +159,8 @@ class ASR:
     Dual ASR router:
       - Basaa-finetuned Whisper for 'lg'
       - Whisper v3 (general) for fr/en/others
-
-    Usage patterns supported:
-      • ASR(path_basaa, path_general)             → dual-core
-      • ASR(path_only, role='basaa'|'general')    → single-core, labeled
-      • ASR(path_only)                            → single-core; used for either role
     """
-    def __init__(
-        self,
-        path_basaa: Optional[str] = None,
-        path_general: Optional[str] = None,
-        role: Optional[str] = None,   # 'basaa' | 'general' | None
-    ):
+    def __init__(self, path_basaa: Optional[str] = None, path_general: Optional[str] = None, role: Optional[str] = None):
         print("[asr] importing app.asr_whisper (dual-capable)…")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
@@ -180,7 +168,6 @@ class ASR:
         self.core_basaa: Optional[_Core] = None
         self.core_general: Optional[_Core] = None
 
-        # Prefer explicit paths; then known symlinks from bootstrap.
         exp_basaa   = [p for p in [path_basaa, "/data/models/whisper_basaa_resolved", "/data/models/whisper_hf_resolved"] if p]
         exp_general = [p for p in [path_general, "/data/models/whisper_general_resolved"] if p]
 
@@ -189,13 +176,11 @@ class ASR:
             if not p.exists():
                 return None
             try:
-                core = _Core(p, self.device, self.dtype)
-                return core
+                return _Core(p, self.device, self.dtype)
             except Exception as e:
                 print(f"[asr] WARN: could not load core at {where}: {e}")
                 return None
 
-        # Role-aware single path?
         if role in ("basaa", "general") and path_basaa and not path_general:
             core = _try_load(path_basaa)
             if role == "basaa":
@@ -203,7 +188,6 @@ class ASR:
             else:
                 self.core_general = core
 
-        # Normal dual-path loading.
         if self.core_basaa is None:
             for p in exp_basaa:
                 core = _try_load(p)
@@ -220,26 +204,18 @@ class ASR:
                     print(f"[asr] General core loaded from: {p}")
                     break
 
-        # If still nothing loaded and we only got a single unspecified path,
-        # load that one as a generic core (usable for any hint).
         if not self.core_basaa and not self.core_general and path_basaa and not path_general and role is None:
             core = _try_load(path_basaa)
-            self.core_general = core  # treat as general by default
+            self.core_general = core
             print(f"[asr] Single core loaded (generic): {path_basaa}")
 
         if not self.core_basaa and not self.core_general:
             raise RuntimeError("No ASR cores available. Check Whisper bundles on disk.")
 
     def transcribe(self, audio_bytes: bytes, lang_hint: Optional[str] = None) -> Tuple[str, str, float]:
-        """
-        Accepts arbitrary WAV/MP3/PCM16 bytes, decodes → 16k mono float32,
-        routes to the appropriate core using lang_hint.
-        """
         wav16 = decode_audio_to_16k_float_mono(audio_bytes)
-
         hint = (lang_hint or "").lower().strip()
         use_basaa = (hint in BASAA_ALIASES) and (self.core_basaa is not None)
         core = self.core_basaa if use_basaa else (self.core_general or self.core_basaa)
-
         text, code, conf = core.transcribe(wav16, lang_hint=hint or None)
         return text, code, conf
