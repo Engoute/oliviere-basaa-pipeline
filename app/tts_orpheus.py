@@ -2,26 +2,23 @@
 from __future__ import annotations
 
 import os
-import math
 import json
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, List, Tuple, Callable, Iterable
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Avoid tokenizer parallelism spam; safe default for services
+# Avoid tokenizer parallelism spam
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# SNAC vocoder (works with local folder via from_pretrained)
+# SNAC vocoder
 from snac import SNAC
 
 
 def _to_channels_time(x: torch.Tensor) -> torch.Tensor:
-    """
-    Ensure [C, T] for writing/returning. Flattens any extra dims into channels.
-    """
+    """Ensure [C, T] for writing/returning. Flattens any extra dims into channels."""
     if x.ndim == 1:
         return x.unsqueeze(0)
     if x.ndim == 2:
@@ -31,7 +28,7 @@ def _to_channels_time(x: torch.Tensor) -> torch.Tensor:
 
 class Orpheus:
     """
-    Orpheus acoustic model + SNAC vocoder (non-streaming, robust).
+    Orpheus acoustic model + SNAC vocoder.
 
     Bundle layout expected:
       <bundle_root>/
@@ -39,14 +36,11 @@ class Orpheus:
         vocoder/          (SNAC dir: config.json + weights)
 
     Public:
-      - tts(text_lg: str, max_new_audio_tokens: Optional[int] = None) -> np.ndarray
-      - stream_tts(text_lg, on_chunk, chunk_ms=600): non-streaming "chunker"
-        (generates once, then slices PCM into callback chunks)
+      - tts(text_lg: str, max_new_audio_tokens: Optional[int] = None) -> np.ndarray (float32 mono @ sr_out)
+      - iter_pcm_stream(text_lg, fmt="pcm16le", chunk_ms=120): yields raw PCM bytes
     """
 
-    # Audio token packing: 7 lanes per frame, each lane in 0..4095
-    # Single global offset used during finetune (matches your working runs)
-    DEFAULT_AUDIO_CODE_OFFSET = 128_266
+    DEFAULT_AUDIO_CODE_OFFSET = 128_266  # 7-lane packing offset you’ve been using
 
     def __init__(
         self,
@@ -115,24 +109,23 @@ class Orpheus:
             torch_dtype=self.dtype,
         ).to(self.device).eval()
 
-        # Load SNAC vocoder (auto-loads config + weights from folder)
+        # SNAC vocoder
         self.snac = SNAC.from_pretrained(vocoder_dir).to(self.device).eval()
 
-        # Derive frames-per-second if present in config, else ~75 fps
+        # Derive FPS & sampling rate from vocoder config when present
         try:
             with open(os.path.join(vocoder_dir, "config.json"), "r", encoding="utf-8") as f:
                 vcfg = json.load(f)
             sr = int(vcfg.get("sampling_rate", self.sr_out))
             hop = vcfg.get("hop_length")
             self.frames_per_sec = (sr / hop) if hop else 75.0
-            # honor vocoder sampling rate for synthesis if present
-            self.sr_out = sr
+            self.sr_out = sr  # honor vocoder sr
         except Exception:
             self.frames_per_sec = 75.0
 
         print(f"[tts] Orpheus ready (sr={self.sr_out} Hz, device={self.device})")
 
-    # ---------- public: robust, non-streaming TTS ----------
+    # ---------- robust, non-streaming TTS ----------
     @torch.no_grad()
     def tts(self, basaa_text: str, max_new_audio_tokens: Optional[int] = None) -> np.ndarray:
         """
@@ -143,7 +136,6 @@ class Orpheus:
         input_ids = enc.input_ids.to(self.device)
         attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=self.device)
 
-        # Token budget from text length (same heuristic you validated in Colab).
         max_new = int(max_new_audio_tokens or self._estimate_max_tokens_from_text(basaa_text))
 
         gen = self.model.generate(
@@ -155,69 +147,63 @@ class Orpheus:
             repetition_penalty=float(self.repetition_penalty),
             max_new_tokens=max_new,
             pad_token_id=self.tok.pad_token_id,
-            eos_token_id=self.tok.eos_token_id,  # text EOS; audio ends when codes stop or budget ends
+            eos_token_id=self.tok.eos_token_id,
         )
 
-        # Extract only new tokens
         tail = gen[0, input_ids.shape[-1]:].tolist()
-        # Trim trailing text EOS if any
         while tail and self.tok.eos_token_id is not None and tail[-1] == self.tok.eos_token_id:
             tail.pop()
 
         if not tail:
-            # return a tiny silence instead of empty, to keep clients happy
             return np.zeros((self.sr_out // 20,), dtype=np.float32)
 
-        # Convert to SNAC code streams
-        codes, n_valid = self._decode_llm_tokens_to_snac_codes(tail, self.code_offset, self.min_frames)
-        # Decode to waveform
-        wav = self.snac.decode(codes)  # usually [1, T] (or [1,1,T])
+        codes, _ = self._decode_llm_tokens_to_snac_codes(tail, self.code_offset, self.min_frames)
+        wav = self.snac.decode(codes)  # [1, T] or similar
         wav = torch.clamp(wav, -1, 1).contiguous()
         wav = _to_channels_time(wav).to(torch.float32)
         if wav.shape[0] != 1:
-            wav = wav.mean(dim=0, keepdim=True)  # mono
+            wav = wav.mean(dim=0, keepdim=True)
         if wav.shape[1] == 0:
             return np.zeros((self.sr_out // 20,), dtype=np.float32)
-
         return wav.squeeze(0).cpu().numpy().astype(np.float32)
 
-    # ---------- optional: "streaming" by slicing the final WAV ----------
-    def stream_tts(
+    # ---------- streaming by slicing the final WAV ----------
+    def iter_pcm_stream(
         self,
         text_lg: str,
-        on_chunk: Callable[[np.ndarray], None],
-        chunk_ms: int = 600,
+        fmt: str = "pcm16le",   # "pcm16le" or "f32le"
+        chunk_ms: int = 120,
         max_new_tokens: Optional[int] = None,
-    ):
+    ) -> Iterable[bytes]:
         """
-        Non-streaming generation under the hood. We synthesize once, then slice
-        the waveform into ~chunk_ms chunks and invoke on_chunk for each.
-        This avoids token-level streaming & WS race conditions.
+        Non-token streaming: synthesize once (same audio as non-streaming),
+        then slice to chunks in the requested PCM format.
         """
         wav = self.tts(text_lg, max_new_audio_tokens=max_new_tokens)
         if wav.size == 0:
             return
         step = max(1, int(self.sr_out * (chunk_ms / 1000.0)))
-        for i in range(0, len(wav), step):
-            chunk = wav[i:i + step]
-            if chunk.size:
-                on_chunk(chunk.astype(np.float32, copy=False))
+        if fmt.lower() == "f32le":
+            wbytes = wav.astype("<f4", copy=False).tobytes(order="C")
+            for i in range(0, len(wbytes), step * 4):
+                yield wbytes[i:i + step * 4]
+        elif fmt.lower() == "pcm16le":
+            x16 = (np.clip(wav, -1.0, 1.0) * 32767.0).astype("<i2", copy=False)
+            wbytes = x16.tobytes(order="C")
+            for i in range(0, len(wbytes), step * 2):
+                yield wbytes[i:i + step * 2]
+        else:
+            raise ValueError(f"Unsupported stream format: {fmt}")
 
     # ---------- internals ----------
     def _format_prompt(self, text: str) -> str:
         bos = self.tok.bos_token or ""
         eos = self.tok.eos_token or ""
-        # Matches your successful prompt: <|voice|> + <|text|> … <|audio|>
         return f"{bos}<|voice|>{self.voice_name}<|text|>{text}{eos}<|audio|>"
 
     def _estimate_max_tokens_from_text(self, text: str) -> int:
-        """
-        Empirical budget from words (≈33 tokens/word), with floors/ceil.
-        Ensures enough room but avoids runaway generations.
-        """
         n_words = max(1, len(text.split()))
         rough = n_words * 33
-        # Keep within sane bounds; also ensure we allow at least min_frames
         return int(max(7 * self.min_frames, min(4 * 4096, rough)))
 
     @staticmethod
@@ -226,14 +212,6 @@ class Orpheus:
         code_offset: int,
         need_min_frames: int = 24,
     ) -> Tuple[List[torch.Tensor], int]:
-        """
-        Orpheus audio packing (7 tokens per frame):
-          frame = [c0, m0, f0, f1, m1, f2, f3]
-          LLM tokens = offset + [c0 + 0*4096, m0 + 1*4096, f0 + 2*4096, ... f3 + 6*4096]
-
-        We de-interleave back into 3 SNAC streams (coarse, mid, fine),
-        skipping any frame where a lane goes out of [0..4095].
-        """
         raw = [t - code_offset - ((i % 7) * 4096) for i, t in enumerate(ids)]
         n_frames = len(raw) // 7
         raw = raw[: n_frames * 7]
@@ -244,16 +222,12 @@ class Orpheus:
             a = i * 7
             frame = raw[a:a + 7]
             if any((x < 0 or x >= 4096) for x in frame):
-                continue  # skip invalid frame
+                continue
             c0, m0, f0, f1, m1, f2, f3 = frame
             C.append(c0)
             M.extend([m0, m1])
             F.extend([f0, f1, f2, f3])
             valid += 1
-
-        if valid < need_min_frames:
-            # Let caller decide; we still return what we have to avoid hard failure
-            pass
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         C = torch.tensor(C, dtype=torch.long, device=device).unsqueeze(0)
@@ -261,24 +235,13 @@ class Orpheus:
         F = torch.tensor(F, dtype=torch.long, device=device).unsqueeze(0)
         return [C, M, F], valid
 
-    # ---------- path helpers ----------
     @staticmethod
     def _resolve_acoustic_dir(bundle_root: str) -> Optional[str]:
-        """
-        Accept either:
-          - .../acoustic_model/
-          - bundle root that contains acoustic_model/
-          - a directory that itself is a valid HF model dir
-        """
         root = Path(bundle_root)
         if (root / "acoustic_model").is_dir():
             return str((root / "acoustic_model").resolve())
-
-        # Direct "this dir is the model" layout
         if (root / "config.json").exists() and (root / "tokenizer.json").exists():
             return str(root.resolve())
-
-        # Otherwise search shallowly for a model directory
         best: Optional[Path] = None
         for cfg in root.rglob("config.json"):
             d = cfg.parent
@@ -292,12 +255,9 @@ class Orpheus:
     @staticmethod
     def _find_vocoder_dir(bundle_root: str) -> Optional[str]:
         root = Path(bundle_root)
-        # Prefer explicit "vocoder" folder
         vd = root / "vocoder"
         if vd.is_dir() and (vd / "config.json").exists():
             return str(vd.resolve())
-
-        # Fallback: search for a folder that looks like a SNAC repo dir
         for cfg in root.rglob("config.json"):
             d = cfg.parent
             if "vocoder" in d.name.lower():
