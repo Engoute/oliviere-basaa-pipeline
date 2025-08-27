@@ -37,9 +37,11 @@ def services():
     if _mt_m2m is None:
         _mt_m2m = M2MTranslator(os.environ.get("PATH_M2M", "/data/models/m2m100_1p2B"))
     if _tts_orpheus is None:
-        _tts_orpheus = Orpheus(os.environ.get("PATH_ORPHEUS", "/data/models/orpheus_bundle"),
-                               sr_out=24000,
-                               voice_name=os.environ.get("ORPHEUS_VOICE", "basaa_speaker"))
+        _tts_orpheus = Orpheus(
+            os.environ.get("PATH_ORPHEUS", "/data/models/orpheus_bundle"),
+            sr_out=24000,
+            voice_name=os.environ.get("ORPHEUS_VOICE", "basaa_speaker"),
+        )
     return _asr_general, _asr_basaa, _llm_qwen, _mt_m2m, _tts_orpheus
 
 async def send_json(ws: WebSocket, typ: str, **payload):
@@ -50,18 +52,18 @@ async def send_json(ws: WebSocket, typ: str, **payload):
 async def root():
     return {"ok": True}
 
-# --------------------------- TEXT: chat (pair) ---------------------------
+# --------------------------- TEXT CHAT (pair) ---------------------------
 @app.websocket("/ws/chat_text")
-async def ws_chat_text(websocket: WebSocket,
-                       lang: str = Query("fr")):
+async def ws_chat_text(websocket: WebSocket, lang: str = Query("fr")):
     """
     Client sends:  {"text": "..."}
     Server replies once with: {"type":"pair","fr":"...","lg":"..."}
-    (FR is Qwen's output; LG is M2M(fr->lg))
+      - fr = Qwen’s answer (French)
+      - lg = M2M(fr->lg) Basaa
     """
     await websocket.accept()
     try:
-        asr_g, asr_lg, llm, m2m, _ = services()
+        _, _, llm, m2m, _ = services()
         while True:
             msg = await websocket.receive_text()
             data = json.loads(msg)
@@ -70,17 +72,17 @@ async def ws_chat_text(websocket: WebSocket,
                 continue
 
             user_text = str(data["text"]).strip()
-            lang_l = (lang or "fr").lower()
+            src = (lang or "fr").lower()
 
             # Prepare a French prompt for Qwen
-            if lang_l == "en":
-                prompt_fr = m2m.en_to_fr(user_text)
-            elif lang_l == "lg":
+            if src == "en":
+                prompt_fr = llm.en_to_fr(user_text)
+            elif src == "lg":
                 prompt_fr = m2m.bas_to_fr(user_text)
             else:
                 prompt_fr = user_text
 
-            fr = llm.chat_as_fr(prompt_fr)          # <- THIS is what you want to show on toggle
+            fr = llm.chat_as_fr(prompt_fr)  # the exact FR you want to show on toggle
             lg = m2m.fr_to_bas(fr)
 
             await send_json(websocket, "pair", fr=fr, lg=lg)
@@ -89,10 +91,9 @@ async def ws_chat_text(websocket: WebSocket,
     except Exception as e:
         await send_json(websocket, "error", message=str(e))
 
-# ----------------------- TEXT: translate (pair) -------------------------
+# ------------------------- TEXT TRANSLATE (pair) ------------------------
 @app.websocket("/ws/translate_text")
-async def ws_translate_text(websocket: WebSocket,
-                            lang: str = Query("fr")):
+async def ws_translate_text(websocket: WebSocket, lang: str = Query("fr")):
     """
     Client sends:  {"text": "..."}
     Server replies once with: {"type":"pair","fr":"...","lg":"..."}
@@ -113,7 +114,7 @@ async def ws_translate_text(websocket: WebSocket,
             text = str(data["text"]).strip()
 
             if src == "en":
-                fr = llm.en_to_fr(text)      # short, robust EN->FR bridge
+                fr = llm.en_to_fr(text)
                 lg = m2m.fr_to_bas(fr)
             elif src == "fr":
                 fr = text
@@ -151,7 +152,7 @@ async def ws_tts_once(websocket: WebSocket):
     except Exception as e:
         await send_json(websocket, "error", message=str(e))
 
-# ---------------------- AUDIO STREAM (listening page) --------------------
+# ---------------------- AUDIO STREAM (ListeningPage) --------------------
 @app.websocket("/ws/audio_chat_stream")
 async def ws_audio_chat_stream(
     websocket: WebSocket,
@@ -159,8 +160,13 @@ async def ws_audio_chat_stream(
     lang: str = Query("fr"),       # "fr" | "en" | "lg"
 ):
     """
-    Same streaming contract we discussed: FR line first, then f32 PCM stream, then full WAV,
-    then Basaa line and ASR last.
+    Contract:
+      1) {"type":"text_line","lang":"fr","text": FR}
+      2) {"type":"pcm_header","sr":24000,"format":"f32le"}
+      3) <binary> f32le chunks (80ms)
+      4) {"type":"wav"}  +  <binary> full WAV
+      5) {"type":"text_line","lang":"lg","text": LG}
+      6) {"type":"text_line","lang":"asr","text": ASR}
     """
     await websocket.accept()
     buf = bytearray()
@@ -206,6 +212,7 @@ async def _handle_stop_stream(ws: WebSocket, payload: bytes, mode: str, lang: st
 
     await send_json(ws, "pcm_header", sr=tts.sr_out, format="f32le")
     wav_f32 = tts.tts(lg_text)
+
     step = max(1, int(tts.sr_out * 0.080))
     f32 = wav_f32.astype("<f4", copy=False)
     for i in range(0, len(f32), step):
