@@ -111,4 +111,4 @@ class LLaVAVideo:
     def describe_image(self, img: Image.Image, question_fr: str) -> str:
         # treat image as a short “video” (repeat few frames)
         frames = [img.convert("RGB")] * 6
-        return self.describe_frames(frames, question_fr)
+        return self.describe_frames(frames, question_fr) 
