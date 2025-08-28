@@ -11,20 +11,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # ---- System deps ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ffmpeg wget unzip ca-certificates libsndfile1 && \
-    rm -rf /var/lib/apt/lists/*
+    git ffmpeg wget unzip ca-certificates libsndfile1 \
+    build-essential python3-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
-# ---- Python deps (ALWAYS via the same interpreter) ----
+# ---- Python deps (ALWAYS via the same python) ----
 COPY requirements.txt ./requirements.txt
-RUN python -m pip install --upgrade pip && \
-    python -m pip install --no-cache-dir -r requirements.txt && \
-    python -m pip uninstall -y torchvision || true && \
-    python - <<'PY'
-import sys, uvicorn
-print("Python exe:", sys.executable)
-print("Uvicorn OK:", uvicorn.__version__)
+
+# upgrade pip/setuptools first (helps many wheels)
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# install your deps (separate step for clearer errors)
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+# get rid of torchvision if the base image preinstalled it
+RUN python -m pip uninstall -y torchvision || true
+
+# prove uvicorn & fastapi are installed for THIS python
+RUN python - <<'PY'
+import sys
+print("python exe:", sys.executable)
+import fastapi, uvicorn
+print("fastapi:", fastapi.__version__)
+print("uvicorn:", uvicorn.__version__)
 PY
 
 # ---- App code ----
@@ -48,7 +59,7 @@ ENV BUNDLE_WHISPER_BASAA_URL="https://huggingface.co/datasets/LeMisterIA/basaa-m
 ENV PATH_WHISPER_GENERAL=$MODELS_DIR/whisper_general
 ENV BUNDLE_WHISPER_GENERAL_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/asr/whisper_v3_general_20250825_223803.zip"
 
-# LLaVA-NeXT-Video (your HF ZIP; private works if HF_TOKEN is set in the pod)
+# LLaVA-NeXT-Video (private OK if HF_TOKEN is set in pod)
 ENV PATH_LLAVA_VIDEO=$MODELS_DIR/llava_next_video
 ENV BUNDLE_LLAVA_VIDEO_URL="https://huggingface.co/LeMisterIA/llava_next_video_bundle/resolve/main/artifacts/llava_next_video_modelonly.zip"
 
