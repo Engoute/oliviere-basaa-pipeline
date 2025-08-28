@@ -25,6 +25,15 @@ from .tts_orpheus import Orpheus
 from .llm_qwen import QwenAgent
 from .utils_audio import wav_bytes_from_float32
 
+# --- extra imports for vision ---
+import io
+from typing import List, Optional
+from PIL import Image
+import av  # PyAV for video parsing
+import torch
+
+# Lazy HF imports inside LLaVA class to avoid top-level import side-effects
+
 app = FastAPI(title="Basaa Realtime Pipeline", version="0.95")
 
 # ---- model singletons --------------------------------------------------------
@@ -43,6 +52,113 @@ TTS       = Orpheus(S.path_orpheus, sr_out=S.tts_sr)
 
 print(f"[main]  PATH_QWEN     = {S.path_qwen}")
 QWEN      = QwenAgent(S.path_qwen)
+
+# -------- LLaVA-NeXT-Video (local-only) ----------
+class _LLaVAVideo:
+    STRICT_FRENCH_INSTRUCTION = (
+        "Tu es un assistant de vision. Réponds UNIQUEMENT en français, "
+        "en 1 à 2 phrases courtes, sans métadonnées ni balises. "
+        "Décris uniquement ce qui est VISIBLE. "
+        "N'invente pas de détails. Si tu n'es pas sûr, réponds: «Je ne suis pas sûr.»"
+    )
+
+    def __init__(self, local_dir: str, device: Optional[str] = None):
+        from transformers import AutoProcessor, AutoTokenizer, LlavaNextVideoForConditionalGeneration
+
+        self.local_dir = local_dir
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.bfloat16 if (self.device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+        self.AutoProcessor = AutoProcessor
+        self.AutoTokenizer = AutoTokenizer
+        self.ModelClass = LlavaNextVideoForConditionalGeneration
+
+        self.processor = self.AutoProcessor.from_pretrained(local_dir, trust_remote_code=True, local_files_only=True)
+        self.tokenizer = getattr(self.processor, "tokenizer", None) or self.AutoTokenizer.from_pretrained(
+            local_dir, trust_remote_code=True, local_files_only=True
+        )
+        self._maybe_load_chat_template(self.tokenizer, local_dir)
+
+        self.model = self.ModelClass.from_pretrained(
+            local_dir, trust_remote_code=True, local_files_only=True,
+            torch_dtype=self.dtype, device_map="auto"
+        ).eval()
+
+    @staticmethod
+    def _maybe_load_chat_template(tok, root: str):
+        if getattr(tok, "chat_template", None):
+            return
+        try:
+            p = os.path.join(root, "chat_template.json")
+            if os.path.isfile(p):
+                data = json.load(open(p, "r", encoding="utf-8"))
+                tmpl = data.get("chat_template") or data.get("template") or (data if isinstance(data, str) else None)
+                if isinstance(tmpl, dict):
+                    tmpl = tmpl.get("template")
+                if isinstance(tmpl, str) and tmpl.strip():
+                    tok.chat_template = tmpl
+        except Exception:
+            pass
+
+    def _build_prompt(self, question_fr: str) -> str:
+        conv = [{
+            "role": "user",
+            "content": [
+                {"type": "video"},
+                {"type": "text", "text": f"{self.STRICT_FRENCH_INSTRUCTION}\n\nQuestion: {question_fr}"},
+            ],
+        }]
+        apply = getattr(self.tokenizer, "apply_chat_template", None) or getattr(self.processor, "apply_chat_template", None)
+        if apply:
+            try:
+                return apply(conv, add_generation_prompt=True, tokenize=False)
+            except TypeError:
+                return apply(conv, add_generation_prompt=True)
+        return f"<s>[INST] {self.STRICT_FRENCH_INSTRUCTION}\n\nQuestion: {question_fr} [/INST]"
+
+    @torch.no_grad()
+    def describe_frames(self, frames: List[Image.Image], question_fr: str, max_new_tokens: int = 96) -> str:
+        prompt = self._build_prompt(question_fr)
+        try:
+            inputs = self.processor(text=prompt, videos=frames, return_tensors="pt")
+        except Exception:
+            inputs = self.processor(text=prompt, videos=[frames], return_tensors="pt")
+
+        pix = inputs.get("pixel_values_videos")
+        if isinstance(pix, list):
+            pix = torch.stack(pix, dim=0)
+        input_ids = inputs.get("input_ids") or self.tokenizer(prompt, return_tensors="pt").input_ids
+
+        input_ids = input_ids.to(self.model.device)
+        pix = pix.to(self.model.device, dtype=self.model.dtype)
+
+        out = self.model.generate(
+            input_ids=input_ids,
+            pixel_values_videos=pix,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,      # greedy to curb hallucinations
+            temperature=0.0,
+            top_p=1.0,
+            use_cache=True,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        text = self.tokenizer.decode(out[0], skip_special_tokens=True).strip()
+        if text.startswith(prompt):
+            text = text[len(prompt):].strip()
+        for m in ("Assistant:", "assistant:", "ASSISTANT:"):
+            if m in text:
+                text = text.split(m, 1)[-1].strip()
+        return text
+
+    @torch.no_grad()
+    def describe_image(self, img: Image.Image, question_fr: str) -> str:
+        frames = [img.convert("RGB")] * 6
+        return self.describe_frames(frames, question_fr)
+
+print(f"[main]  PATH_LLAVA_VIDEO = {os.environ.get('PATH_LLAVA_VIDEO', '/data/models/llava_next_video')}")
+VISION = _LLaVAVideo(os.environ.get("PATH_LLAVA_VIDEO", "/data/models/llava_next_video"))
 
 print(f"[main] Models ready.")
 
@@ -303,6 +419,101 @@ async def ws_audio_chat(ws: WebSocket):
             await ws.send_bytes(wav_bytes)
         except Exception:
             pass
+    except Exception:
+        traceback.print_exc()
+    finally:
+        await _safe_close(ws)
+
+# -------------------- VISION helpers & endpoint ----------------------------
+def _extract_frames_from_video_bytes(blob: bytes, max_frames: int = 12) -> list[Image.Image]:
+    """Decode sparse frames from a short video using PyAV."""
+    frames: list[Image.Image] = []
+    with av.open(io.BytesIO(blob)) as container:
+        vstreams = [s for s in container.streams if s.type == "video"]
+        if not vstreams:
+            return frames
+        stream = vstreams[0]
+        total = max(1, int(stream.frames or 60))
+        step = max(1, total // max_frames)
+        idx = 0
+        for packet in container.demux(stream):
+            for f in packet.decode():
+                if idx % step == 0 and len(frames) < max_frames:
+                    img = f.to_image().convert("RGB")
+                    frames.append(img)
+                idx += 1
+                if len(frames) >= max_frames:
+                    break
+            if len(frames) >= max_frames:
+                break
+    return frames
+
+@app.websocket("/ws/vision_once")
+async def ws_vision_once(ws: WebSocket):
+    """
+    Contract:
+      - (optional) first TEXT frame: {"question":"Qu’est-ce que tu vois ?"}
+      - one BINARY frame: image (PNG/JPEG) **or** short video (mp4/webm)
+      - then client sends "DONE"
+    Server replies:
+      - TEXT JSON once: {"fr":"...", "lg":"..."}
+      - BINARY once: full WAV (Basaa TTS of 'lg')
+    """
+    await ws.accept()
+    question = "Décris brièvement ce que tu vois."
+    blob = bytearray()
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.receive":
+                if msg.get("text"):
+                    txt = msg["text"].strip()
+                    if txt.upper() == "DONE":
+                        break
+                    try:
+                        obj = json.loads(txt)
+                        if isinstance(obj, dict) and "question" in obj:
+                            q = str(obj["question"]).strip()
+                            if q: question = q
+                    except Exception:
+                        pass
+                elif msg.get("bytes"):
+                    blob.extend(msg["bytes"])
+            elif msg["type"] == "websocket.disconnect":
+                return
+
+        if not blob:
+            await ws.send_text(json.dumps({"error": "no image/video payload"}, ensure_ascii=False))
+            return
+
+        data = bytes(blob)
+        frames: list[Image.Image] = []
+        # Try image first
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            frames = [img] * 6
+        except Exception:
+            # Not an image → try video
+            try:
+                frames = _extract_frames_from_video_bytes(data, max_frames=12)
+            except Exception:
+                frames = []
+
+        if not frames:
+            await ws.send_text(json.dumps({"error": "could not decode image/video"}, ensure_ascii=False))
+            return
+
+        # Vision → French (strict, greedy)
+        fr = VISION.describe_frames(frames, question_fr=question)
+        # French → Basaa
+        lg = MT.to_lg(fr, "fr")
+
+        await ws.send_text(json.dumps({"fr": fr, "lg": lg}, ensure_ascii=False))
+
+        # TTS Basaa (full WAV)
+        wav = synthesize_wav_safe(lg)
+        await ws.send_bytes(wav_bytes_from_float32(wav, S.tts_sr))
+
     except Exception:
         traceback.print_exc()
     finally:
