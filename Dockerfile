@@ -9,6 +9,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_NO_TORCHVISION=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Ensure conda python is first on PATH
+ENV PATH=/opt/conda/bin:${PATH}
+
 # ---- System deps ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ffmpeg wget unzip ca-certificates libsndfile1 && \
@@ -16,11 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-# ---- Python deps ----
+# ---- Python deps (install into conda env) ----
 COPY requirements.txt ./requirements.txt
-RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install --no-cache-dir -r requirements.txt && \
-    python3 -m pip uninstall -y torchvision || true
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --no-cache-dir -r requirements.txt && \
+    python -m pip uninstall -y torchvision || true
 
 # ---- App code ----
 COPY app/ ./app/
@@ -39,30 +42,28 @@ ENV MODELS_DIR=/data/models
 ENV PATH_WHISPER_BASAA=$MODELS_DIR/whisper_hf
 ENV BUNDLE_WHISPER_BASAA_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/whisper_hf_bundle_20250821_070627.zip"
 
-# Whisper v3 (general) — your uploaded ZIP
+# Whisper v3 (general)
 ENV PATH_WHISPER_GENERAL=$MODELS_DIR/whisper_general
 ENV BUNDLE_WHISPER_GENERAL_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/asr/whisper_v3_general_20250825_223803.zip"
 
-# NEW: LLaVA-NeXT-Video bundle (model-only ZIP you uploaded)
+# LLaVA-NeXT-Video (your ZIP; set HF_TOKEN if private)
 ENV PATH_LLAVA_VIDEO=$MODELS_DIR/llava_next_video
-# If private, set HF_TOKEN at runtime. Public works without it.
 ENV BUNDLE_LLAVA_VIDEO_URL="https://huggingface.co/LeMisterIA/llava_next_video_bundle/resolve/main/artifacts/llava_next_video_modelonly.zip"
 
 # Orpheus bundle
 ENV PATH_ORPHEUS=$MODELS_DIR/orpheus_bundle
 ENV BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/orpheus_bundle_20250825_073332.zip"
 
-# M2M-100 + Qwen (paths usually pre-mounted; bundle URLs optional)
+# M2M + Qwen (optional bundles)
 ENV PATH_M2M=$MODELS_DIR/m2m100_1p2B
 ENV BUNDLE_M2M_URL=""
 ENV PATH_QWEN=$MODELS_DIR/qwen2_5_instruct_7b
 ENV BUNDLE_QWEN_URL=""
 
-# Legacy back-compat
+# Back-compat
 ENV PATH_WHISPER=$PATH_WHISPER_BASAA
 
 EXPOSE 7860
 
-# ---- Launch ----
-# Use python3 consistently for both bootstrap and uvicorn to avoid "No module named uvicorn"
-CMD bash -lc "python3 bootstrap.py && python3 -m uvicorn app.main:app --host ${HOST} --port ${PORT}"
+# ---- Launch (use conda python) ----
+CMD bash -lc "python bootstrap.py && python -m uvicorn app.main:app --host ${HOST} --port ${PORT}"
