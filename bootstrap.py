@@ -158,9 +158,13 @@ def main():
     basaa_url  = os.environ.get("BUNDLE_WHISPER_BASAA_URL", "")
     path_basaa = Path(os.environ.get("PATH_WHISPER_BASAA", str(MODELS_DIR / "whisper_hf")))
 
-    # Whisper v3 general (Distil-Large-v3 zipped)
+    # Whisper v3 general
     general_url  = os.environ.get("BUNDLE_WHISPER_GENERAL_URL", "")
     path_general = Path(os.environ.get("PATH_WHISPER_GENERAL", str(MODELS_DIR / "whisper_general")))
+
+    # LLaVA-NeXT-Video (NEW)
+    llava_url  = os.environ.get("BUNDLE_LLAVA_VIDEO_URL", "")
+    path_llava = Path(os.environ.get("PATH_LLAVA_VIDEO", str(MODELS_DIR / "llava_next_video")))
 
     m2m_url      = os.environ.get("BUNDLE_M2M_URL", "")
     path_m2m     = Path(os.environ.get("PATH_M2M",     str(MODELS_DIR / "m2m100_1p2B")))
@@ -172,8 +176,9 @@ def main():
     path_qwen    = Path(os.environ.get("PATH_QWEN",    str(MODELS_DIR / "qwen2_5_instruct_7b")))
 
     # Normalize any accidental FILE paths to their parent DIRs
-    path_basaa  = _ensure_dir_path(path_basaa)
+    path_basaa   = _ensure_dir_path(path_basaa)
     path_general = _ensure_dir_path(path_general)
+    path_llava   = _ensure_dir_path(path_llava)
     path_m2m     = _ensure_dir_path(path_m2m)
     path_orpheus = _ensure_dir_path(path_orpheus)
     path_qwen    = _ensure_dir_path(path_qwen)
@@ -192,6 +197,12 @@ def main():
     general_real = _resolve_whisper_hf_dir(path_general) or path_general
     _mk_symlink("whisper_general_resolved", general_real)
     print(f"[bootstrap] Whisper General resolved -> {general_real}")
+
+    # ----- LLaVA-NeXT-Video (NEW) -----
+    print(f"[bootstrap] PATH_LLAVA_VIDEO = {path_llava}")
+    if llava_url: _fetch_and_unzip(llava_url, path_llava)
+    # just link the root dir (config + tokenizer + model shards)
+    _mk_symlink("llava_next_video_resolved", path_llava)
 
     # ----- M2M -----
     print(f"[bootstrap] PATH_M2M = {path_m2m}")
@@ -218,7 +229,7 @@ def main():
     if qwen_url: _fetch_and_unzip(qwen_url, path_qwen)
 
     # Sanitize generation config problems
-    for root in [path_basaa, path_general, path_m2m, path_orpheus, path_qwen, MODELS_DIR]:
+    for root in [path_basaa, path_general, path_llava, path_m2m, path_orpheus, path_qwen, MODELS_DIR]:
         _disable_generation_configs(root)
     _patch_config_json(path_m2m); _patch_config_json(path_qwen)
     if ac_dir: _patch_config_json(ac_dir)
