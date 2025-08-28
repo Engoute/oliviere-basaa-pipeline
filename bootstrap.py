@@ -22,9 +22,6 @@ def _ensure_dir_path(p: Path) -> Path:
     return p
 
 def _download_url(url: str, dst: Path):
-    """
-    Download with optional Bearer auth if HF_TOKEN is set and URL is on huggingface.co.
-    """
     token = os.environ.get("HF_TOKEN", "").strip()
     req = urllib.request.Request(url)
     if token and "huggingface.co" in url:
@@ -35,7 +32,6 @@ def _download_url(url: str, dst: Path):
 def _fetch_and_unzip(url: str, target: Path):
     if not url:
         return
-    # handle accidental symlink path
     if target.exists() and target.is_symlink():
         try:
             target.unlink()
@@ -62,10 +58,6 @@ def _has_any(p: Path, patterns: Iterable[str]) -> bool:
     return False
 
 def _disable_generation_configs(root: Path):
-    """
-    Disable all generation_config.json files under root exactly once each.
-    (Fixes double-rename noise you observed.)
-    """
     n = 0
     try:
         paths = {p.resolve() for p in root.rglob("generation_config.json")}
@@ -73,13 +65,11 @@ def _disable_generation_configs(root: Path):
             try:
                 dst = gc.with_suffix(gc.suffix + ".disabled")
                 if dst.exists():
-                    # already disabled
                     continue
                 gc.rename(dst)
                 print(f"[bootstrap] disabled {gc}")
                 n += 1
             except FileNotFoundError:
-                # file moved by earlier pass; ignore
                 continue
             except Exception as e:
                 print(f"[bootstrap] WARN: could not disable {gc}: {e}")
@@ -179,15 +169,12 @@ def _mk_symlink(name: str, target_dir: Path):
 
 # ---------- main ----------
 def main():
-    # Basaa Whisper (finetuned)
     basaa_url  = os.environ.get("BUNDLE_WHISPER_BASAA_URL", "")
     path_basaa = Path(os.environ.get("PATH_WHISPER_BASAA", str(MODELS_DIR / "whisper_hf")))
 
-    # Whisper v3 general
     general_url  = os.environ.get("BUNDLE_WHISPER_GENERAL_URL", "")
     path_general = Path(os.environ.get("PATH_WHISPER_GENERAL", str(MODELS_DIR / "whisper_general")))
 
-    # LLaVA-NeXT-Video (NEW)
     llava_url  = os.environ.get("BUNDLE_LLAVA_VIDEO_URL", "")
     path_llava = Path(os.environ.get("PATH_LLAVA_VIDEO", str(MODELS_DIR / "llava_next_video")))
 
@@ -200,7 +187,6 @@ def main():
     qwen_url     = os.environ.get("BUNDLE_QWEN_URL", "")
     path_qwen    = Path(os.environ.get("PATH_QWEN",    str(MODELS_DIR / "qwen2_5_instruct_7b")))
 
-    # Normalize any accidental FILE paths to their parent DIRs
     path_basaa   = _ensure_dir_path(path_basaa)
     path_general = _ensure_dir_path(path_general)
     path_llava   = _ensure_dir_path(path_llava)
@@ -208,31 +194,26 @@ def main():
     path_orpheus = _ensure_dir_path(path_orpheus)
     path_qwen    = _ensure_dir_path(path_qwen)
 
-    # ----- Whisper Basaa -----
     print(f"[bootstrap] PATH_WHISPER_BASAA = {path_basaa}")
     if basaa_url: _fetch_and_unzip(basaa_url, path_basaa)
     basaa_real = _resolve_whisper_hf_dir(path_basaa) or path_basaa
-    _mk_symlink("whisper_hf_resolved", basaa_real)   # keep old link name
+    _mk_symlink("whisper_hf_resolved", basaa_real)
     _mk_symlink("whisper_basaa_resolved", basaa_real)
     print(f"[bootstrap] Whisper Basaa resolved -> {basaa_real}")
 
-    # ----- Whisper General -----
     print(f"[bootstrap] PATH_WHISPER_GENERAL = {path_general}")
     if general_url: _fetch_and_unzip(general_url, path_general)
     general_real = _resolve_whisper_hf_dir(path_general) or path_general
     _mk_symlink("whisper_general_resolved", general_real)
     print(f"[bootstrap] Whisper General resolved -> {general_real}")
 
-    # ----- LLaVA-NeXT-Video (NEW) -----
     print(f"[bootstrap] PATH_LLAVA_VIDEO = {path_llava}")
     if llava_url: _fetch_and_unzip(llava_url, path_llava)
     _mk_symlink("llava_next_video_resolved", path_llava)
 
-    # ----- M2M -----
     print(f"[bootstrap] PATH_M2M = {path_m2m}")
     if m2m_url: _fetch_and_unzip(m2m_url, path_m2m)
 
-    # ----- Orpheus -----
     print(f"[bootstrap] PATH_ORPHEUS = {path_orpheus}")
     if orpheus_url: _fetch_and_unzip(orpheus_url, path_orpheus)
     ac_dir = _resolve_orpheus_acoustic(path_orpheus)
@@ -248,17 +229,14 @@ def main():
     else:
         print(f"[bootstrap] WARN: Orpheus vocoder not found under {path_orpheus}")
 
-    # ----- Qwen -----
     print(f"[bootstrap] PATH_QWEN = {path_qwen}")
     if qwen_url: _fetch_and_unzip(qwen_url, path_qwen)
 
-    # Sanitize generation config problems
     for root in [path_basaa, path_general, path_llava, path_m2m, path_orpheus, path_qwen, MODELS_DIR]:
         _disable_generation_configs(root)
     _patch_config_json(path_m2m); _patch_config_json(path_qwen)
     if ac_dir: _patch_config_json(ac_dir)
 
-    # sanity for M2M
     m2m_has_weights = _has_any(path_m2m, ("pytorch_model.bin", "model.safetensors", "model-*.safetensors"))
     m2m_has_tok     = _has_any(path_m2m, ("tokenizer.json", "*sentencepiece*.model", "*spm.*", "sentencepiece.bpe.model"))
     if not (m2m_has_weights and m2m_has_tok):
