@@ -7,29 +7,37 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     HF_HUB_ENABLE_HF_TRANSFER=0 \
     TRANSFORMERS_NO_TORCHVISION=1 \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PIP_PREFER_BINARY=1
 
-# ---- System deps ----
+# ---- System deps (add build tools for wheels that might compile) ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ffmpeg wget unzip ca-certificates libsndfile1 \
-    build-essential python3-dev \
+    build-essential python3-dev cmake ninja-build \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
-# ---- Python deps (ALWAYS via the same python) ----
+# ---- Python deps (always use the same interpreter) ----
 COPY requirements.txt ./requirements.txt
 
-# upgrade pip/setuptools first (helps many wheels)
+# Filter out torch/torchaudio (already provided by the base image with CUDA)
+RUN awk 'tolower($0) !~ /^torch([[:space:]=<>]|$)/ && tolower($0) !~ /^torchaudio([[:space:]=<>]|$)/ {print}' requirements.txt > requirements.notorch.txt
+
+# Upgrade pip toolchain first
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# install your deps (separate step for clearer errors)
-RUN python -m pip install --no-cache-dir -r requirements.txt
+# Install PyPI deps (prefer wheels, clearer error surface)
+RUN python -m pip install --no-cache-dir --prefer-binary -r requirements.notorch.txt
 
-# get rid of torchvision if the base image preinstalled it
+# Install the git dependency separately so failures are obvious
+RUN python -m pip install --no-cache-dir --prefer-binary \
+    git+https://github.com/hubertsiuzdak/snac.git@8f79a71
+
+# Remove torchvision if the base image had it baked in
 RUN python -m pip uninstall -y torchvision || true
 
-# prove uvicorn & fastapi are installed for THIS python
+# Sanity: ensure FastAPI/uvicorn are actually importable from THIS python
 RUN python - <<'PY'
 import sys
 print("python exe:", sys.executable)
@@ -59,7 +67,7 @@ ENV BUNDLE_WHISPER_BASAA_URL="https://huggingface.co/datasets/LeMisterIA/basaa-m
 ENV PATH_WHISPER_GENERAL=$MODELS_DIR/whisper_general
 ENV BUNDLE_WHISPER_GENERAL_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/asr/whisper_v3_general_20250825_223803.zip"
 
-# LLaVA-NeXT-Video (private OK if HF_TOKEN is set in pod)
+# LLaVA-NeXT-Video (private OK if HF_TOKEN is set in the pod)
 ENV PATH_LLAVA_VIDEO=$MODELS_DIR/llava_next_video
 ENV BUNDLE_LLAVA_VIDEO_URL="https://huggingface.co/LeMisterIA/llava_next_video_bundle/resolve/main/artifacts/llava_next_video_modelonly.zip"
 
@@ -67,7 +75,7 @@ ENV BUNDLE_LLAVA_VIDEO_URL="https://huggingface.co/LeMisterIA/llava_next_video_b
 ENV PATH_ORPHEUS=$MODELS_DIR/orpheus_bundle
 ENV BUNDLE_ORPHEUS_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/bundles/orpheus_bundle_20250825_073332.zip"
 
-# M2M + Qwen (optional bundles)
+# M2M + Qwen (optional bundles, often mounted as volume)
 ENV PATH_M2M=$MODELS_DIR/m2m100_1p2B
 ENV BUNDLE_M2M_URL=""
 ENV PATH_QWEN=$MODELS_DIR/qwen2_5_instruct_7b
