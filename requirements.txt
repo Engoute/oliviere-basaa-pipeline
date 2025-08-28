@@ -1,23 +1,26 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-websockets==12.0
-orjson==3.10.7
+ fastapi==0.111.0
+ uvicorn[standard]==0.29.0
+ websockets==12.0
+ orjson==3.10.7
 
-# Core ML (match your base image: runpod/pytorch:2.8.0-…)
-torch==2.8.0
-torchaudio==2.8.0
+ # Core ML (match your base image: runpod/pytorch:2.8.0-…)
+ torch==2.8.0
+ torchaudio==2.8.0
 
-# HF stack — pin modern pair so tokenizer.json loads
-transformers==4.45.2
-tokenizers==0.20.1
-accelerate==0.34.2
-safetensors==0.4.3
-protobuf==5.27.2
-huggingface_hub==0.24.7
-numpy==1.26.4
+ # HF stack — pin modern pair so tokenizer.json loads
+ transformers==4.45.2
+ tokenizers==0.20.1
+ accelerate==0.34.2
+ safetensors==0.4.3
+ protobuf==5.27.2
+ huggingface_hub==0.24.7
+ numpy==1.26.4
 
-# M2M-100
-sentencepiece==0.2.0
+ # M2M-100
+ sentencepiece==0.2.0
 
-# SNAC (your exact commit)
-git+https://github.com/hubertsiuzdak/snac.git@8f79a71
+ # SNAC (your exact commit)
+ git+https://github.com/hubertsiuzdak/snac.git@8f79a71
++Pillow>=10.3.0
++av==12.2.0
++opencv-python-headless==4.10.0.84
