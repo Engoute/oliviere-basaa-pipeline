@@ -53,6 +53,10 @@ ENV BUNDLE_M2M_URL=""
 ENV PATH_QWEN=$MODELS_DIR/qwen2_5_instruct_7b
 ENV BUNDLE_QWEN_URL=""
 
+# LLaVA-NeXT-Video (NEW) — the 10.45 GB ZIP you uploaded
+ENV PATH_LLAVA_VIDEO=$MODELS_DIR/llava_next_video
+ENV BUNDLE_LLAVA_VIDEO_URL="https://huggingface.co/LeMisterIA/llava_next_video_bundle/resolve/main/artifacts/llava_next_video_modelonly.zip"
+
 # Legacy back-compat
 ENV PATH_WHISPER=$PATH_WHISPER_BASAA
 
