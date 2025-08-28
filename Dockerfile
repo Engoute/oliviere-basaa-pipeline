@@ -22,7 +22,16 @@ WORKDIR /workspace
 COPY requirements.txt ./requirements.txt
 
 # Filter out torch/torchaudio (already provided by the base image with CUDA)
-RUN awk 'tolower($0) !~ /^torch([[:space:]=<>]|$)/ && tolower($0) !~ /^torchaudio([[:space:]=<>]|$)/ {print}' requirements.txt > requirements.notorch.txt
+# - Trim leading whitespace first so ' torch==...' is still filtered
+# - Drop comment/blank lines
+# - Drop accidental diff markers starting with '+'
+RUN awk '{line=$0; sub(/^[ \t]+/, "", line); \
+          if (line ~ /^(\#|$)/) next; \
+          if (line ~ /^\+/) next; \
+          l=tolower(line); \
+          if (l ~ /^torch([[:space:]=<>]|$)/) next; \
+          if (l ~ /^torchaudio([[:space:]=<>]|$)/) next; \
+          print line }' requirements.txt > requirements.notorch.txt
 
 # Upgrade pip toolchain first
 RUN python -m pip install --upgrade pip setuptools wheel
