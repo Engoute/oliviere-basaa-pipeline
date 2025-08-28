@@ -1,4 +1,4 @@
-import os, zipfile, shutil, tempfile, urllib.request, urllib.error, json
+import os, zipfile, shutil, tempfile, urllib.request, json
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -21,13 +21,20 @@ def _ensure_dir_path(p: Path) -> Path:
         pass
     return p
 
+def _download_url(url: str, dst: Path):
+    """
+    Download with optional Bearer auth if HF_TOKEN is set and URL is on huggingface.co.
+    """
+    token = os.environ.get("HF_TOKEN", "").strip()
+    req = urllib.request.Request(url)
+    if token and "huggingface.co" in url:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req) as r, open(dst, "wb") as f:
+        shutil.copyfileobj(r, f)
+
 def _fetch_and_unzip(url: str, target: Path):
-    """
-    Downloads a ZIP (supports private Hugging Face repos via HF_TOKEN) and extracts it to `target`.
-    """
     if not url:
         return
-
     # handle accidental symlink path
     if target.exists() and target.is_symlink():
         try:
@@ -37,37 +44,13 @@ def _fetch_and_unzip(url: str, target: Path):
             print(f"[bootstrap] WARN: could not unlink {target}: {e}")
     target = _ensure_dir_path(target)
     target.mkdir(parents=True, exist_ok=True)
-
     if _have_any(target):
         print(f"[bootstrap] Exists: {target}")
         return
-
     print(f"[bootstrap] Downloading: {url}")
-
-    token = (os.environ.get("HF_TOKEN") or "").strip()
-    headers = {
-        "User-Agent": "bootstrap/1.0 (+https://runpod.io)",
-        "Accept": "application/octet-stream",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    req = urllib.request.Request(url, headers=headers)
-
     with tempfile.TemporaryDirectory() as td:
         zpath = Path(td) / "bundle.zip"
-        try:
-            with urllib.request.urlopen(req) as r, open(zpath, "wb") as f:
-                shutil.copyfileobj(r, f)
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                print("[bootstrap] ERROR: 401 Unauthorized while fetching the ZIP.")
-                print("            If the repo is private, set HF_TOKEN in the environment.")
-            raise
-        except Exception as e:
-            print(f"[bootstrap] ERROR: download failed: {e}")
-            raise
-
+        _download_url(url, zpath)
         print(f"[bootstrap] Unzipping -> {target}")
         with zipfile.ZipFile(zpath, "r") as z:
             z.extractall(target)
@@ -79,14 +62,29 @@ def _has_any(p: Path, patterns: Iterable[str]) -> bool:
     return False
 
 def _disable_generation_configs(root: Path):
+    """
+    Disable all generation_config.json files under root exactly once each.
+    (Fixes double-rename noise you observed.)
+    """
     n = 0
-    for gc in list(root.glob("generation_config.json")) + list(root.rglob("generation_config.json")):
-        try:
-            gc.rename(gc.with_suffix(gc.suffix + ".disabled"))
-            print(f"[bootstrap] disabled {gc}")
-            n += 1
-        except Exception as e:
-            print(f"[bootstrap] WARN: could not disable {gc}: {e}")
+    try:
+        paths = {p.resolve() for p in root.rglob("generation_config.json")}
+        for gc in sorted(paths):
+            try:
+                dst = gc.with_suffix(gc.suffix + ".disabled")
+                if dst.exists():
+                    # already disabled
+                    continue
+                gc.rename(dst)
+                print(f"[bootstrap] disabled {gc}")
+                n += 1
+            except FileNotFoundError:
+                # file moved by earlier pass; ignore
+                continue
+            except Exception as e:
+                print(f"[bootstrap] WARN: could not disable {gc}: {e}")
+    except Exception as e:
+        print(f"[bootstrap] WARN: generation config scan failed under {root}: {e}")
     if n == 0:
         print(f"[bootstrap] no generation_config.json under {root}")
 
@@ -189,13 +187,10 @@ def main():
     general_url  = os.environ.get("BUNDLE_WHISPER_GENERAL_URL", "")
     path_general = Path(os.environ.get("PATH_WHISPER_GENERAL", str(MODELS_DIR / "whisper_general")))
 
-    # LLaVA-NeXT-Video (NEW) – support both var names
-    llava_url  = (os.environ.get("BUNDLE_LLAVA_URL", "")
-                  or os.environ.get("BUNDLE_LLAVA_VIDEO_URL", ""))
-    path_llava = Path(os.environ.get("PATH_LLAVA",
-                    os.environ.get("PATH_LLAVA_VIDEO", str(MODELS_DIR / "llava_next_video"))))
+    # LLaVA-NeXT-Video (NEW)
+    llava_url  = os.environ.get("BUNDLE_LLAVA_VIDEO_URL", "")
+    path_llava = Path(os.environ.get("PATH_LLAVA_VIDEO", str(MODELS_DIR / "llava_next_video")))
 
-    # M2M / Orpheus / Qwen
     m2m_url      = os.environ.get("BUNDLE_M2M_URL", "")
     path_m2m     = Path(os.environ.get("PATH_M2M",     str(MODELS_DIR / "m2m100_1p2B")))
 
@@ -231,7 +226,6 @@ def main():
     # ----- LLaVA-NeXT-Video (NEW) -----
     print(f"[bootstrap] PATH_LLAVA_VIDEO = {path_llava}")
     if llava_url: _fetch_and_unzip(llava_url, path_llava)
-    # just link the root dir (config + tokenizer + model shards)
     _mk_symlink("llava_next_video_resolved", path_llava)
 
     # ----- M2M -----
