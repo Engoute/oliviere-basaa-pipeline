@@ -1,7 +1,4 @@
-# FILE: app/main.py
 from __future__ import annotations
-
-# --- IMPORTANT: block torchvision before transformers loads anywhere ---
 import os
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 
@@ -29,17 +26,13 @@ from .utils_audio import wav_bytes_from_float32
 import io
 from typing import List, Optional
 from PIL import Image
-import av  # PyAV for video parsing
+import av
 import torch
-
-# Lazy HF imports inside LLaVA class to avoid top-level import side-effects
 
 app = FastAPI(title="Basaa Realtime Pipeline", version="0.95")
 
-# ---- model singletons --------------------------------------------------------
 print(f"[main] Initializing models…")
 
-# ASR dual: basaa + general
 print(f"[main]  PATH_WHISPER_BASAA  = {S.path_whisper_basaa}")
 print(f"[main]  PATH_WHISPER_GENERAL= {S.path_whisper_general or '(none)'}")
 ASR_MODEL = ASR(S.path_whisper_basaa or S.path_whisper, S.path_whisper_general or None)
@@ -61,25 +54,20 @@ class _LLaVAVideo:
         "Décris uniquement ce qui est VISIBLE. "
         "N'invente pas de détails. Si tu n'es pas sûr, réponds: «Je ne suis pas sûr.»"
     )
-
     def __init__(self, local_dir: str, device: Optional[str] = None):
         from transformers import AutoProcessor, AutoTokenizer, LlavaNextVideoForConditionalGeneration
-
         self.local_dir = local_dir
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if (self.device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
         torch.backends.cuda.matmul.allow_tf32 = True
-
         self.AutoProcessor = AutoProcessor
         self.AutoTokenizer = AutoTokenizer
         self.ModelClass = LlavaNextVideoForConditionalGeneration
-
         self.processor = self.AutoProcessor.from_pretrained(local_dir, trust_remote_code=True, local_files_only=True)
         self.tokenizer = getattr(self.processor, "tokenizer", None) or self.AutoTokenizer.from_pretrained(
             local_dir, trust_remote_code=True, local_files_only=True
         )
         self._maybe_load_chat_template(self.tokenizer, local_dir)
-
         self.model = self.ModelClass.from_pretrained(
             local_dir, trust_remote_code=True, local_files_only=True,
             torch_dtype=self.dtype, device_map="auto"
@@ -137,7 +125,7 @@ class _LLaVAVideo:
             input_ids=input_ids,
             pixel_values_videos=pix,
             max_new_tokens=max_new_tokens,
-            do_sample=False,      # greedy to curb hallucinations
+            do_sample=False,
             temperature=0.0,
             top_p=1.0,
             use_cache=True,
@@ -162,17 +150,12 @@ VISION = _LLaVAVideo(os.environ.get("PATH_LLAVA_VIDEO", "/data/models/llava_next
 
 print(f"[main] Models ready.")
 
-# ---- small helpers -----------------------------------------------------------
 async def _safe_close(ws: WebSocket):
     try:
         if getattr(ws, "client_state", None) != WebSocketState.DISCONNECTED:
             await ws.close()
     except Exception:
         pass
-
-def _looks_basaa(text: str) -> bool:
-    t = text.lower()
-    return any(c in "ŋɓƁàáâèéêìíîòóôùúûɛɔ" for c in t)
 
 def _normalize_tts_text(text: str) -> str:
     kept = []
@@ -206,14 +189,10 @@ def _split_for_tts(text: str, max_len: int = 240) -> list[str]:
     return out
 
 def _is_bad_wave(w: np.ndarray) -> bool:
-    if w is None or not isinstance(w, np.ndarray) or w.size == 0:
-        return True
-    if not np.all(np.isfinite(w)):
-        return True
-    if w.shape[0] < int(0.10 * S.tts_sr):  # <100ms
-        return True
-    if float(np.std(w)) < 1e-5:
-        return True
+    if w is None or not isinstance(w, np.ndarray) or w.size == 0: return True
+    if not np.all(np.isfinite(w)): return True
+    if w.shape[0] < int(0.10 * S.tts_sr): return True
+    if float(np.std(w)) < 1e-5: return True
     return False
 
 def synthesize_wav_safe(text: str) -> np.ndarray:
@@ -221,7 +200,6 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
     chunks = _split_for_tts(clean)
     if not chunks:
         return np.zeros(int(0.3 * S.tts_sr), dtype=np.float32)
-
     waves: list[np.ndarray] = []
     for chunk in chunks:
         wav = None
@@ -229,20 +207,17 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
             wav = TTS.tts(chunk)
         except Exception:
             wav = None
-
         if _is_bad_wave(wav):
-            simple = re.sub(r"[^A-Za-zÀ-ÿ0-9\s]", "", chunk)
-            simple = re.sub(r"\s+", " ", simple).strip()
+            import re as _re
+            simple = _re.sub(r"[^A-Za-zÀ-ÿ0-9\s]", "", chunk)
+            simple = _re.sub(r"\s+", " ", simple).strip()
             try:
                 wav = TTS.tts(simple)
             except Exception:
                 wav = None
-
         if _is_bad_wave(wav):
             wav = np.zeros(int(0.2 * S.tts_sr), dtype=np.float32)
-
         waves.append(wav.astype(np.float32, copy=False))
-
     out = np.concatenate(waves, dtype=np.float32) if waves else np.zeros(0, dtype=np.float32)
     if out.size:
         peak = float(np.max(np.abs(out)))
@@ -250,12 +225,10 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
             out = out * (0.99 / peak)
     return out
 
-# --------------------------------------------------------------------------
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
 
-# -------------------- text endpoints --------------------------------------
 @app.websocket("/ws/translate_text")
 async def ws_translate_text(ws: WebSocket):
     await ws.accept()
@@ -265,16 +238,11 @@ async def ws_translate_text(ws: WebSocket):
             payload = json.loads(payload_raw) if payload_raw.startswith("{") else {"text": payload_raw}
         except Exception:
             payload = {"text": payload_raw}
-
         text = (payload.get("text") or "").strip()
         src_hint = (payload.get("lang") or payload.get("src") or "").strip().lower()
-
-        # Resolve safe src for M2M (hint-first, then heuristics/fallback)
         src = MT.resolve_safe_src(text, src_hint or None)
-
         out_fr = MT.to_fr(text, src)
         out_lg = MT.to_lg(text, src)
-
         await ws.send_text(json.dumps({"fr": out_fr, "lg": out_lg}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
@@ -290,29 +258,40 @@ async def ws_chat_text(ws: WebSocket):
             payload = json.loads(payload_raw) if payload_raw.startswith("{") else {"text": payload_raw}
         except Exception:
             payload = {"text": payload_raw}
-
         user_text = (payload.get("text") or "").strip()
         src_hint  = (payload.get("lang") or payload.get("src") or "").strip().lower()
-
-        # Normalize to French for Qwen, then back to Basaa (hint-first)
         src     = MT.resolve_safe_src(user_text, src_hint or None)
         user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
         qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
         basaa   = MT.to_lg(qwen_fr, "fr")
-
         await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
     except Exception:
         traceback.print_exc()
     finally:
         await _safe_close(ws)
 
-# -------------------- TTS once (non-streaming WAV) ------------------------
+# ---------- FIXED: accept JSON OR raw text; normalize to Basaa before TTS ----------
 @app.websocket("/ws/tts_once")
 async def ws_tts_once(ws: WebSocket):
     await ws.accept()
     try:
-        text = (await ws.receive_text()).strip()
-        wav = synthesize_wav_safe(text)
+        raw = (await ws.receive_text()).strip()
+        text = raw
+        lang_hint = None
+
+        if raw.startswith("{"):
+            try:
+                obj = json.loads(raw)
+                text = (obj.get("text") or "").strip()
+                lang_hint = (obj.get("lang") or obj.get("src") or "").strip().lower() or None
+            except Exception:
+                text = raw
+
+        # Resolve source language and ensure Basaa text for Orpheus
+        src = MT.resolve_safe_src(text, lang_hint or None)
+        basaa_text = text if src == "lg" else MT.to_lg(text, src)
+
+        wav = synthesize_wav_safe(basaa_text)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
         try:
             await ws.send_bytes(wav_bytes)
@@ -323,15 +302,10 @@ async def ws_tts_once(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
-# ---- helpers for audio sockets: read JSON header then bytes ---------------
+# ---- helpers for audio sockets --------------------------------------------
 async def _read_audio_and_header(ws: WebSocket):
-    """
-    Reads optional first TEXT frame as JSON header {lang|src}, then accumulates bytes
-    until 'DONE'. Returns (audio_bytes, lang_hint).
-    """
     buf = bytearray()
     lang_hint = None
-
     try:
         while True:
             msg = await ws.receive()
@@ -342,13 +316,11 @@ async def _read_audio_and_header(ws: WebSocket):
                         continue
                     if txt.upper() == "DONE":
                         break
-                    # first or later headers allowed
                     try:
                         obj = json.loads(txt)
                         if isinstance(obj, dict):
                             lang_hint = (obj.get("lang") or obj.get("src") or lang_hint)
                     except Exception:
-                        # ignore non-JSON text
                         pass
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
@@ -361,27 +333,16 @@ async def _read_audio_and_header(ws: WebSocket):
 
     return bytes(buf), (lang_hint or "").lower().strip() or None
 
-# -------------------- non-streaming audio: translate -----------------------
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
     await ws.accept()
     audio, lang_hint = await _read_audio_and_header(ws)
-
     try:
         text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
-        # HINT FIRST: prefer the explicit client hint; fall back to Whisper's detected language
         src = MT.resolve_safe_src(text, lang_hint or wlang)
-
         fr_text = MT.to_fr(text, src)
         lg_text = MT.to_lg(text, src)
-
-        # text json first
-        await ws.send_text(json.dumps(
-            {"asr": {"text": text, "lang": src}, "fr": fr_text, "lg": lg_text},
-            ensure_ascii=False
-        ))
-
-        # synth full wav once (Basaa)
+        await ws.send_text(json.dumps({"asr": {"text": text, "lang": src}, "fr": fr_text, "lg": lg_text}, ensure_ascii=False))
         wav = synthesize_wav_safe(lg_text)
         wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
         try:
@@ -393,30 +354,20 @@ async def ws_translate(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
-# -------------------- non-streaming audio: chat ----------------------------
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(ws: WebSocket):
     await ws.accept()
     audio, lang_hint = await _read_audio_and_header(ws)
-
     try:
         user_text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
-        # HINT FIRST
         src     = MT.resolve_safe_src(user_text, lang_hint or wlang)
         user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
-
         qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
         basaa   = MT.to_lg(qwen_fr, "fr")
-
-        await ws.send_text(json.dumps(
-            {"asr": {"text": user_text, "lang": src}, "fr": qwen_fr, "lg": basaa},
-            ensure_ascii=False
-        ))
-
+        await ws.send_text(json.dumps({"asr": {"text": user_text, "lang": src}, "fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
         wav = synthesize_wav_safe(basaa)
-        wav_bytes = wav_bytes_from_float32(wav, S.tts_sr)
         try:
-            await ws.send_bytes(wav_bytes)
+            await ws.send_bytes(wav_bytes_from_float32(wav, S.tts_sr))
         except Exception:
             pass
     except Exception:
@@ -424,14 +375,12 @@ async def ws_audio_chat(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
-# -------------------- VISION helpers & endpoint ----------------------------
+# -------------------- Vision ----------------------------
 def _extract_frames_from_video_bytes(blob: bytes, max_frames: int = 12) -> list[Image.Image]:
-    """Decode sparse frames from a short video using PyAV."""
     frames: list[Image.Image] = []
     with av.open(io.BytesIO(blob)) as container:
         vstreams = [s for s in container.streams if s.type == "video"]
-        if not vstreams:
-            return frames
+        if not vstreams: return frames
         stream = vstreams[0]
         total = max(1, int(stream.frames or 60))
         step = max(1, total // max_frames)
@@ -442,23 +391,12 @@ def _extract_frames_from_video_bytes(blob: bytes, max_frames: int = 12) -> list[
                     img = f.to_image().convert("RGB")
                     frames.append(img)
                 idx += 1
-                if len(frames) >= max_frames:
-                    break
-            if len(frames) >= max_frames:
-                break
+                if len(frames) >= max_frames: break
+            if len(frames) >= max_frames: break
     return frames
 
 @app.websocket("/ws/vision_once")
 async def ws_vision_once(ws: WebSocket):
-    """
-    Contract:
-      - (optional) first TEXT frame: {"question":"Qu’est-ce que tu vois ?"}
-      - one BINARY frame: image (PNG/JPEG) **or** short video (mp4/webm)
-      - then client sends "DONE"
-    Server replies:
-      - TEXT JSON once: {"fr":"...", "lg":"..."}
-      - BINARY once: full WAV (Basaa TTS of 'lg')
-    """
     await ws.accept()
     question = "Décris brièvement ce que tu vois."
     blob = bytearray()
@@ -483,34 +421,25 @@ async def ws_vision_once(ws: WebSocket):
                 return
 
         if not blob:
-            await ws.send_text(json.dumps({"error": "no image/video payload"}, ensure_ascii=False))
-            return
+            await ws.send_text(json.dumps({"error": "no image/video payload"}, ensure_ascii=False)); return
 
         data = bytes(blob)
         frames: list[Image.Image] = []
-        # Try image first
         try:
             img = Image.open(io.BytesIO(data)).convert("RGB")
             frames = [img] * 6
         except Exception:
-            # Not an image → try video
             try:
                 frames = _extract_frames_from_video_bytes(data, max_frames=12)
             except Exception:
                 frames = []
 
         if not frames:
-            await ws.send_text(json.dumps({"error": "could not decode image/video"}, ensure_ascii=False))
-            return
+            await ws.send_text(json.dumps({"error": "could not decode image/video"}, ensure_ascii=False)); return
 
-        # Vision → French (strict, greedy)
         fr = VISION.describe_frames(frames, question_fr=question)
-        # French → Basaa
         lg = MT.to_lg(fr, "fr")
-
         await ws.send_text(json.dumps({"fr": fr, "lg": lg}, ensure_ascii=False))
-
-        # TTS Basaa (full WAV)
         wav = synthesize_wav_safe(lg)
         await ws.send_bytes(wav_bytes_from_float32(wav, S.tts_sr))
 
@@ -519,7 +448,6 @@ async def ws_vision_once(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
-# -------------------- aliases kept for client compatibility ----------------
 @app.websocket("/ws/translate_stream")
 async def ws_translate_stream(ws: WebSocket):
     await ws_translate(ws)
