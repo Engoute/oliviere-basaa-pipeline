@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_NO_TORCHVISION=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Ensure conda python is first on PATH
+# Make sure conda python/pip are used
 ENV PATH=/opt/conda/bin:${PATH}
 
 # ---- System deps ----
@@ -19,11 +19,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-# ---- Python deps (install into conda env) ----
+# ---- Python deps (install into the conda env) ----
 COPY requirements.txt ./requirements.txt
-RUN python -m pip install --upgrade pip && \
-    python -m pip install --no-cache-dir -r requirements.txt && \
-    python -m pip uninstall -y torchvision || true
+RUN /opt/conda/bin/python -m pip install --upgrade pip && \
+    /opt/conda/bin/python -m pip install --no-cache-dir -r requirements.txt && \
+    /opt/conda/bin/python -m pip uninstall -y torchvision || true
+
+# Sanity check at build time (fail early if uvicorn not in this interpreter)
+RUN /opt/conda/bin/python -c "import sys; print('python:', sys.executable)" && \
+    /opt/conda/bin/python -c "import uvicorn; print('uvicorn ok')"
 
 # ---- App code ----
 COPY app/ ./app/
@@ -46,7 +50,7 @@ ENV BUNDLE_WHISPER_BASAA_URL="https://huggingface.co/datasets/LeMisterIA/basaa-m
 ENV PATH_WHISPER_GENERAL=$MODELS_DIR/whisper_general
 ENV BUNDLE_WHISPER_GENERAL_URL="https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/asr/whisper_v3_general_20250825_223803.zip"
 
-# LLaVA-NeXT-Video (your ZIP; set HF_TOKEN if private)
+# LLaVA-NeXT-Video (HF private OK with HF_TOKEN)
 ENV PATH_LLAVA_VIDEO=$MODELS_DIR/llava_next_video
 ENV BUNDLE_LLAVA_VIDEO_URL="https://huggingface.co/LeMisterIA/llava_next_video_bundle/resolve/main/artifacts/llava_next_video_modelonly.zip"
 
@@ -65,5 +69,5 @@ ENV PATH_WHISPER=$PATH_WHISPER_BASAA
 
 EXPOSE 7860
 
-# ---- Launch (use conda python) ----
-CMD bash -lc "python bootstrap.py && python -m uvicorn app.main:app --host ${HOST} --port ${PORT}"
+# ---- Launch (call conda python explicitly) ----
+CMD ["/bin/bash","-lc","/opt/conda/bin/python bootstrap.py && /opt/conda/bin/python -m uvicorn app.main:app --host ${HOST} --port ${PORT}"]
