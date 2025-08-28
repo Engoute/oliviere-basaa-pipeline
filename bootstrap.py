@@ -1,4 +1,4 @@
-import os, zipfile, shutil, tempfile, urllib.request, json
+import os, zipfile, shutil, tempfile, urllib.request, urllib.error, json
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -22,8 +22,12 @@ def _ensure_dir_path(p: Path) -> Path:
     return p
 
 def _fetch_and_unzip(url: str, target: Path):
+    """
+    Downloads a ZIP (supports private Hugging Face repos via HF_TOKEN) and extracts it to `target`.
+    """
     if not url:
         return
+
     # handle accidental symlink path
     if target.exists() and target.is_symlink():
         try:
@@ -33,14 +37,37 @@ def _fetch_and_unzip(url: str, target: Path):
             print(f"[bootstrap] WARN: could not unlink {target}: {e}")
     target = _ensure_dir_path(target)
     target.mkdir(parents=True, exist_ok=True)
+
     if _have_any(target):
         print(f"[bootstrap] Exists: {target}")
         return
+
     print(f"[bootstrap] Downloading: {url}")
+
+    token = (os.environ.get("HF_TOKEN") or "").strip()
+    headers = {
+        "User-Agent": "bootstrap/1.0 (+https://runpod.io)",
+        "Accept": "application/octet-stream",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(url, headers=headers)
+
     with tempfile.TemporaryDirectory() as td:
         zpath = Path(td) / "bundle.zip"
-        with urllib.request.urlopen(url) as r, open(zpath, "wb") as f:
-            shutil.copyfileobj(r, f)
+        try:
+            with urllib.request.urlopen(req) as r, open(zpath, "wb") as f:
+                shutil.copyfileobj(r, f)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print("[bootstrap] ERROR: 401 Unauthorized while fetching the ZIP.")
+                print("            If the repo is private, set HF_TOKEN in the environment.")
+            raise
+        except Exception as e:
+            print(f"[bootstrap] ERROR: download failed: {e}")
+            raise
+
         print(f"[bootstrap] Unzipping -> {target}")
         with zipfile.ZipFile(zpath, "r") as z:
             z.extractall(target)
@@ -162,10 +189,13 @@ def main():
     general_url  = os.environ.get("BUNDLE_WHISPER_GENERAL_URL", "")
     path_general = Path(os.environ.get("PATH_WHISPER_GENERAL", str(MODELS_DIR / "whisper_general")))
 
-    # LLaVA-NeXT-Video (NEW)
-    llava_url  = os.environ.get("BUNDLE_LLAVA_VIDEO_URL", "")
-    path_llava = Path(os.environ.get("PATH_LLAVA_VIDEO", str(MODELS_DIR / "llava_next_video")))
+    # LLaVA-NeXT-Video (NEW) – support both var names
+    llava_url  = (os.environ.get("BUNDLE_LLAVA_URL", "")
+                  or os.environ.get("BUNDLE_LLAVA_VIDEO_URL", ""))
+    path_llava = Path(os.environ.get("PATH_LLAVA",
+                    os.environ.get("PATH_LLAVA_VIDEO", str(MODELS_DIR / "llava_next_video"))))
 
+    # M2M / Orpheus / Qwen
     m2m_url      = os.environ.get("BUNDLE_M2M_URL", "")
     path_m2m     = Path(os.environ.get("PATH_M2M",     str(MODELS_DIR / "m2m100_1p2B")))
 
