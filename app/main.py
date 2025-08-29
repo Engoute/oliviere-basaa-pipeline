@@ -106,7 +106,7 @@ class _LLaVAVideo:
                 {"type": "video"},
                 {"type": "text", "text": f"{self.STRICT_FRENCH_INSTRUCTION}\n\nQuestion: {question_fr}"},
             ],
-        }]]
+        }]
         apply = getattr(self.tokenizer, "apply_chat_template", None) or getattr(self.processor, "apply_chat_template", None)
         if apply:
             try:
