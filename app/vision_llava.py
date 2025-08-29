@@ -80,14 +80,14 @@ class LLaVAVideo:
         except Exception:
             inputs = self.processor(text=prompt, videos=[frames], return_tensors="pt")
 
-        # pixel values key name may vary by version
+        # Pixel values key can vary by processor version; avoid boolean 'or' on tensors
         pix = inputs.get("pixel_values_videos", None)
         if pix is None:
             pix = inputs.get("pixel_values", None)
         if isinstance(pix, list):
             pix = torch.stack(pix, dim=0)
 
-        # IMPORTANT: never use tensors in `or` — check explicitly
+        # DO NOT use tensors in boolean expressions; check explicitly
         input_ids = inputs.get("input_ids", None)
         if (input_ids is None) or (hasattr(input_ids, "nelement") and input_ids.nelement() == 0):
             toks = self.tokenizer(prompt, return_tensors="pt")
@@ -108,7 +108,6 @@ class LLaVAVideo:
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
         )
-
         text = self.tokenizer.decode(out[0], skip_special_tokens=True).strip()
         if text.startswith(prompt):
             text = text[len(prompt):].strip()
