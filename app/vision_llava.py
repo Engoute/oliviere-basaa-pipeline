@@ -1,4 +1,3 @@
-# FILE: app/vision_llava.py
 from __future__ import annotations
 import io, json, time, os
 from typing import List, Optional
@@ -117,7 +116,8 @@ class LLaVAVideo:
         if sample:
             gen_kwargs.update(dict(do_sample=True, temperature=0.2, top_p=0.9))
         else:
-            gen_kwargs.update(dict(do_sample=False, temperature=0.0, top_p=1.0))
+            # Deterministic: don't include temperature/top_p to avoid warnings.
+            gen_kwargs.update(dict(do_sample=False))
 
         out = self.model.generate(**gen_kwargs)
         return out
