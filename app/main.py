@@ -1,3 +1,4 @@
+# FILE: app/main.py
 from __future__ import annotations
 
 # --- IMPORTANT: block torchvision before transformers loads anywhere ---
@@ -105,7 +106,7 @@ class _LLaVAVideo:
                 {"type": "video"},
                 {"type": "text", "text": f"{self.STRICT_FRENCH_INSTRUCTION}\n\nQuestion: {question_fr}"},
             ],
-        }]
+        }]]
         apply = getattr(self.tokenizer, "apply_chat_template", None) or getattr(self.processor, "apply_chat_template", None)
         if apply:
             try:
@@ -122,10 +123,17 @@ class _LLaVAVideo:
         except Exception:
             inputs = self.processor(text=prompt, videos=[frames], return_tensors="pt")
 
-        pix = inputs.get("pixel_values_videos")
+        # Pixel values can be under different keys; avoid boolean 'or' with tensors
+        pix = inputs.get("pixel_values_videos", None)
+        if pix is None:
+            pix = inputs.get("pixel_values", None)
         if isinstance(pix, list):
             pix = torch.stack(pix, dim=0)
-        input_ids = inputs.get("input_ids") or self.tokenizer(prompt, return_tensors="pt").input_ids
+
+        input_ids = inputs.get("input_ids", None)
+        if (input_ids is None) or (hasattr(input_ids, "nelement") and input_ids.nelement() == 0):
+            toks = self.tokenizer(prompt, return_tensors="pt")
+            input_ids = toks["input_ids"]
 
         input_ids = input_ids.to(self.model.device)
         pix = pix.to(self.model.device, dtype=self.model.dtype)
@@ -497,7 +505,12 @@ async def ws_vision_once(ws: WebSocket):
             await ws.send_text(json.dumps({"error": "could not decode image/video"}, ensure_ascii=False))
             return
 
-        fr = VISION.describe_frames(frames, question_fr=question)
+        try:
+            fr = VISION.describe_frames(frames, question_fr=question)
+        except Exception as e:
+            await ws.send_text(json.dumps({"error": f"vision_failed: {type(e).__name__}: {e}"}, ensure_ascii=False))
+            return
+
         lg = MT.to_lg(fr, "fr")
 
         await ws.send_text(json.dumps({"fr": fr, "lg": lg}, ensure_ascii=False))
