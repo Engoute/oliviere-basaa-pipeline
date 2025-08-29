@@ -80,11 +80,20 @@ class LLaVAVideo:
         except Exception:
             inputs = self.processor(text=prompt, videos=[frames], return_tensors="pt")
 
-        pix = inputs.get("pixel_values_videos")
+        # pixel values key name may vary by version
+        pix = inputs.get("pixel_values_videos", None)
+        if pix is None:
+            pix = inputs.get("pixel_values", None)
         if isinstance(pix, list):
             pix = torch.stack(pix, dim=0)
-        input_ids = inputs.get("input_ids") or self.tokenizer(prompt, return_tensors="pt").input_ids
 
+        # IMPORTANT: never use tensors in `or` — check explicitly
+        input_ids = inputs.get("input_ids", None)
+        if (input_ids is None) or (hasattr(input_ids, "nelement") and input_ids.nelement() == 0):
+            toks = self.tokenizer(prompt, return_tensors="pt")
+            input_ids = toks["input_ids"]
+
+        # Move to device/dtype
         input_ids = input_ids.to(self.model.device)
         pix = pix.to(self.model.device, dtype=self.model.dtype)
 
@@ -92,13 +101,14 @@ class LLaVAVideo:
             input_ids=input_ids,
             pixel_values_videos=pix,
             max_new_tokens=max_new_tokens,
-            do_sample=False,          # ← no sampling to curb hallucinations
+            do_sample=False,          # curb hallucinations
             temperature=0.0,
             top_p=1.0,
             use_cache=True,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
         )
+
         text = self.tokenizer.decode(out[0], skip_special_tokens=True).strip()
         if text.startswith(prompt):
             text = text[len(prompt):].strip()
@@ -111,4 +121,4 @@ class LLaVAVideo:
     def describe_image(self, img: Image.Image, question_fr: str) -> str:
         # treat image as a short “video” (repeat few frames)
         frames = [img.convert("RGB")] * 6
-        return self.describe_frames(frames, question_fr) 
+        return self.describe_frames(frames, question_fr)
