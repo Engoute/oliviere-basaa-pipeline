@@ -1,3 +1,4 @@
+# FILE: api-ws.py
 from __future__ import annotations
 import asyncio, json, os, io
 from typing import Optional
@@ -347,7 +348,11 @@ async def ws_vision_once(websocket: WebSocket):
                             continue
 
                         # LLaVA French description (strict FR, low hallucination)
-                        fr_text = llava.describe_image(img, question_fr)
+                        try:
+                            fr_text = llava.describe_image(img, question_fr)
+                        except Exception as e:
+                            await send_json(websocket, "error", message=f"vision_failed: {type(e).__name__}: {e}")
+                            return
 
                         # Basaa text from French
                         lg_text = m2m.fr_to_bas(fr_text)
