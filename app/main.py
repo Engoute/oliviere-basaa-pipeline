@@ -1,4 +1,3 @@
-# FILE: app/main.py
 from __future__ import annotations
 
 # --- IMPORTANT: block torchvision before transformers loads anywhere ---
@@ -27,8 +26,9 @@ from .utils_audio import wav_bytes_from_float32
 
 # --- extra imports for vision ---
 import io
+import time
 from typing import List, Optional
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 import av  # PyAV for video parsing
 import torch
 
@@ -165,7 +165,8 @@ class _LLaVAVideo:
         if sample:
             gen_kwargs.update(dict(do_sample=True, temperature=0.2, top_p=0.9))
         else:
-            gen_kwargs.update(dict(do_sample=False, temperature=0.0, top_p=1.0))
+            # Deterministic path: do NOT set temperature/top_p to avoid HF warning.
+            gen_kwargs.update(dict(do_sample=False))
 
         out = self.model.generate(**gen_kwargs)
         return out
@@ -254,7 +255,7 @@ def _split_for_tts(text: str, max_len: int = 240) -> list[str]:
 
 def _is_bad_wave(w: np.ndarray) -> bool:
     if w is None or not isinstance(w, np.ndarray) or w.size == 0:
-        return True
+        True
     if not np.all(np.isfinite(w)):
         return True
     if w.shape[0] < int(0.10 * TTS.sr_out):  # <100ms, use actual Orpheus SR
@@ -469,6 +470,43 @@ async def ws_audio_chat(ws: WebSocket):
     finally:
         await _safe_close(ws)
 
+# -------------------- VISION debug helpers ---------------------------------
+def _save_debug_blob(data: bytes, ext_hint: str = "bin") -> str:
+    ts = int(time.time() * 1000)
+    path = f"/tmp/vision_in_{ts}.{ext_hint}"
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        print(f"[vision] saved payload -> {path} ({len(data)} bytes)")
+    except Exception as e:
+        print(f"[vision] failed to save payload: {e}")
+    return path
+
+def _mean_brightness(img: Image.Image) -> float:
+    # 0..255 mean over all channels
+    import numpy as np
+    arr = np.asarray(img.convert("RGB"), dtype="float32")
+    return float(arr.mean())
+
+def _brighten_if_too_dark(img: Image.Image, threshold: float = 22.0) -> tuple[Image.Image, float, bool]:
+    """
+    If image mean brightness is below threshold, apply autocontrast + brightness boost.
+    Returns (possibly-updated-image, mean_after, did_modify)
+    """
+    m0 = _mean_brightness(img)
+    if m0 >= threshold:
+        return img, m0, False
+    try:
+        # Autocontrast then brighten ~2x; tune conservatively
+        img2 = ImageOps.autocontrast(img, cutoff=1)
+        img2 = ImageEnhance.Brightness(img2).enhance(2.0)
+        m1 = _mean_brightness(img2)
+        print(f"[vision] brighten: mean {m0:.1f} -> {m1:.1f}")
+        return img2, m1, True
+    except Exception as e:
+        print(f"[vision] brighten failed: {e}")
+        return img, m0, False
+
 # -------------------- VISION helpers & endpoint ----------------------------
 def _extract_frames_from_video_bytes(blob: bytes, max_frames: int = 12) -> list[Image.Image]:
     frames: list[Image.Image] = []
@@ -531,16 +569,45 @@ async def ws_vision_once(ws: WebSocket):
             return
 
         data = bytes(blob)
+
+        # --- save the raw payload so we can inspect what the client really sent ---
+        ext = "bin"
+        if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+            ext = "png"
+        elif len(data) >= 2 and data[:2] == b"\xFF\xD8":
+            ext = "jpg"
+        elif data[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00 ", b"RIFF"):
+            ext = "mp4"
+        _save_debug_blob(data, ext)
+
+        # Decode to frames
         frames: list[Image.Image] = []
         # Try image first
         try:
             img = Image.open(io.BytesIO(data)).convert("RGB")
+            print(f"[vision] image decoded: {img.size}, mean={_mean_brightness(img):.1f}")
+            img, _, did = _brighten_if_too_dark(img)
+            if did:
+                ts = int(time.time() * 1000)
+                bright_path = f"/tmp/vision_bright_{ts}.jpg"
+                try:
+                    img.save(bright_path, "JPEG", quality=92)
+                    print(f"[vision] wrote brightened image -> {bright_path}")
+                except Exception:
+                    pass
             frames = [img] * 6
         except Exception:
             # Not an image → try video
             try:
                 frames = _extract_frames_from_video_bytes(data, max_frames=12)
-            except Exception:
+                if frames:
+                    m = _mean_brightness(frames[0])
+                    print(f"[vision] video frames: {len(frames)}, first={frames[0].size}, mean={m:.1f}")
+                    fr0, _, did = _brighten_if_too_dark(frames[0])
+                    if did:
+                        frames[0] = fr0
+            except Exception as e:
+                print(f"[vision] video decode failed: {e}")
                 frames = []
 
         if not frames:
