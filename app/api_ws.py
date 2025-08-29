@@ -1,16 +1,17 @@
-# app/api_ws.py
 from __future__ import annotations
-import asyncio, json, os
+import asyncio, json, os, io
 from typing import Optional
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 
 from .utils_audio import decode_audio_to_16k_float_mono, wav_bytes_from_float32
 from .asr_whisper import WhisperGeneralASR, WhisperBasaaASR
 from .llm_qwen import QwenInstruct
 from .mt_m2m import M2MTranslator
 from .tts_orpheus import Orpheus
+from .vision_llava import LLaVAVideo
 
 app = FastAPI()
 app.add_middleware(
@@ -25,8 +26,10 @@ _asr_basaa: Optional[WhisperBasaaASR] = None
 _llm_qwen: Optional[QwenInstruct] = None
 _mt_m2m: Optional[M2MTranslator] = None
 _tts_orpheus: Optional[Orpheus] = None
+_llava: Optional[LLaVAVideo] = None
 
 def services():
+    """Keep arity stable for existing callers."""
     global _asr_general, _asr_basaa, _llm_qwen, _mt_m2m, _tts_orpheus
     if _asr_general is None:
         _asr_general = WhisperGeneralASR(os.environ.get("PATH_WHISPER_GENERAL", "/data/models/whisper_general_resolved"))
@@ -44,6 +47,12 @@ def services():
         )
     return _asr_general, _asr_basaa, _llm_qwen, _mt_m2m, _tts_orpheus
 
+def vision_service() -> LLaVAVideo:
+    global _llava
+    if _llava is None:
+        _llava = LLaVAVideo(os.environ.get("PATH_LLAVA_VIDEO", "/data/models/llava_next_video_resolved"))
+    return _llava
+
 async def send_json(ws: WebSocket, typ: str, **payload):
     data = dict(payload); data["type"] = typ
     await ws.send_text(json.dumps(data, ensure_ascii=False))
@@ -55,7 +64,9 @@ async def root():
 # --------------------------- helpers ---------------------------
 def _norm_lang(s: Optional[str]) -> str:
     s = (s or "fr").lower().strip()
-    return "lg" if s in ("lg","bas","basaa") else ("en" if s == "en" else "fr")
+    if s in ("lg","bas","basaa"): return "lg"
+    if s == "en": return "en"
+    return "fr"
 
 def _is_stop(payload: str) -> bool:
     try:
@@ -75,13 +86,16 @@ def _maybe_lang(payload: str) -> Optional[str]:
         pass
     return None
 
+def _is_vision_hint(payload: str) -> bool:
+    try:
+        data = json.loads(payload)
+        return isinstance(data, dict) and bool(data.get("vision"))
+    except Exception:
+        return False
+
 # --------------------------- TEXT CHAT (pair) ---------------------------
 @app.websocket("/ws/chat_text")
 async def ws_chat_text(websocket: WebSocket):
-    """
-    Client sends:  {"text": "...", "lang": "fr|en|lg"}   // 'lang' optional
-    Server replies once with: {"type":"pair","fr":"...","lg":"..."}
-    """
     await websocket.accept()
     try:
         _, _, llm, m2m, _ = services()
@@ -95,7 +109,6 @@ async def ws_chat_text(websocket: WebSocket):
             user_text = str(data["text"]).strip()
             src = _norm_lang(data.get("lang") or data.get("src"))
 
-            # Prepare a French prompt for Qwen
             if src == "en":
                 prompt_fr = llm.en_to_fr(user_text)
             elif src == "lg":
@@ -115,10 +128,6 @@ async def ws_chat_text(websocket: WebSocket):
 # ------------------------- TEXT TRANSLATE (pair) ------------------------
 @app.websocket("/ws/translate_text")
 async def ws_translate_text(websocket: WebSocket):
-    """
-    Client sends:  {"text": "...", "src": "fr|en|lg"}    // 'src' or 'lang' optional
-    Server replies once with: {"type":"pair","fr":"...","lg":"..."}
-    """
     await websocket.accept()
     try:
         _, _, llm, m2m, _ = services()
@@ -151,9 +160,6 @@ async def ws_translate_text(websocket: WebSocket):
 # ----------------------- ONE-SHOT TTS ----------------
 @app.websocket("/ws/tts_once")
 async def ws_tts_once(websocket: WebSocket):
-    """
-    Client sends: {"text":"..."} OR raw text; server returns raw WAV bytes once.
-    """
     await websocket.accept()
     try:
         *_, tts = services()
@@ -177,14 +183,6 @@ async def ws_tts_once(websocket: WebSocket):
 # ---------------------- AUDIO CHAT (NON-STREAMING) ----------------------
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(websocket: WebSocket):
-    """
-    Non-streaming audio conversation:
-      - client sends PCM16 16k mono frames
-      - client sends "DONE" (or {"type":"stop"})
-      - server replies:
-          * {"fr":"...", "lg":"...", "asr": "..."}   (one JSON block)
-          * <binary WAV> (Basaa TTS)
-    """
     await websocket.accept()
     buf = bytearray()
     cur_lang = "fr"
@@ -198,45 +196,38 @@ async def ws_audio_chat(websocket: WebSocket):
                 elif msg.get("text"):
                     txt = msg["text"]
                     if _is_stop(txt):
-                        # process
                         x16 = decode_audio_to_16k_float_mono(bytes(buf))
                         if x16.size == 0:
                             await send_json(websocket, "error", message="empty audio")
                             buf.clear()
                             continue
 
-                        # ASR
                         lang = _norm_lang(cur_lang)
                         if lang in ("fr","en"):
+                            # Force Whisper-General to that language (no auto-detect)
                             asr_text = asr_general.transcribe(x16, lang=lang)
                         else:
                             asr_text = asr_basaa.transcribe(x16)
 
-                        # Build FR
                         if lang == "en":
                             fr_text = llm.en_to_fr(asr_text)
                         elif lang == "lg":
-                            # LG input -> converse in FR (Qwen on FR pivot)
                             fr_text = llm.chat_as_fr(m2m.bas_to_fr(asr_text))
                         else:
                             fr_text = llm.chat_as_fr(asr_text)
 
-                        # Basaa text via M2M
                         lg_text = m2m.fr_to_bas(fr_text)
 
-                        # Send pair (client shows Basaa first, then FR after WAV)
                         await websocket.send_text(json.dumps(
                             {"fr": fr_text, "lg": lg_text, "asr": asr_text},
                             ensure_ascii=False
                         ))
 
-                        # TTS -> single WAV
                         wav = tts.tts(lg_text)
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
                         buf.clear()
                     else:
-                        # maybe a language header
                         maybe = _maybe_lang(txt)
                         if maybe: cur_lang = maybe
             elif msg["type"] == "websocket.disconnect":
@@ -249,18 +240,6 @@ async def ws_audio_chat(websocket: WebSocket):
 # ---------------------- TRANSLATE (NON-STREAMING) -----------------------
 @app.websocket("/ws/translate")
 async def ws_translate(websocket: WebSocket):
-    """
-    Non-streaming audio translate:
-      - client sends PCM16 16k mono frames
-      - client sends "DONE" (or {"type":"stop"})
-      - server replies:
-          * {"fr":"...", "lg":"...", "asr": "..."}   (one JSON block)
-          * <binary WAV> (Basaa TTS of lg)
-      Behavior:
-        - src=fr: fr=ASR,      lg=fr->lg
-        - src=en: fr=en->fr,   lg=fr->lg
-        - src=lg: fr=lg->fr,   lg=ASR (echo)
-    """
     await websocket.accept()
     buf = bytearray()
     cur_lang = "fr"
@@ -300,9 +279,7 @@ async def ws_translate(websocket: WebSocket):
                             ensure_ascii=False
                         ))
 
-                        # TTS
-                        wav_src_text = lg_text  # always speak Basaa in translate mode
-                        wav = tts.tts(wav_src_text)
+                        wav = tts.tts(lg_text)
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
                         buf.clear()
@@ -316,22 +293,107 @@ async def ws_translate(websocket: WebSocket):
     except Exception as e:
         await send_json(websocket, "error", message=str(e))
 
+# ---------------------- VISION ONCE (AUDIO + 1 IMAGE) -------------------
+@app.websocket("/ws/vision_once")
+async def ws_vision_once(websocket: WebSocket):
+    """
+    Vision + audio (non-streaming, single turn):
+      Client sends:
+        - {"lang": "fr|en|lg"}  (optional, can be sent anytime before DONE)
+        - <binary PCM16 16k mono chunks>  (speech)
+        - {"vision": true, "task": "describe"}  (hint)
+        - <binary JPEG/PNG>  (single image/frame)
+        - "DONE"
+      Server replies:
+        - {"fr":"...", "lg":"...", "asr":"..."}
+        - <binary WAV>  (Basaa TTS of LG line)
+    """
+    await websocket.accept()
+    buf_audio = bytearray()
+    img_bytes: Optional[bytes] = None
+    cur_lang = "fr"
+    vision_mode = False
+    try:
+        asr_general, asr_basaa, llm, m2m, tts = services()
+        llava = vision_service()
+
+        while True:
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.receive":
+                if msg.get("bytes"):
+                    # route bytes: image if we are in vision mode and no image yet; otherwise audio
+                    if vision_mode and img_bytes is None:
+                        img_bytes = msg["bytes"]
+                    else:
+                        buf_audio.extend(msg["bytes"])
+                elif msg.get("text"):
+                    txt = msg["text"]
+                    if _is_stop(txt):
+                        # --- process turn ---
+                        x16 = decode_audio_to_16k_float_mono(bytes(buf_audio))
+                        if x16.size == 0:
+                            await send_json(websocket, "error", message="empty audio")
+                            buf_audio.clear(); img_bytes = None; vision_mode = False
+                            continue
+
+                        lang = _norm_lang(cur_lang)
+                        if lang in ("fr","en"):
+                            asr_text = asr_general.transcribe(x16, lang=lang)  # forced language
+                        else:
+                            asr_text = asr_basaa.transcribe(x16)
+
+                        # Build French question/prompt from ASR
+                        if lang == "en":
+                            question_fr = llm.en_to_fr(asr_text)
+                        elif lang == "lg":
+                            question_fr = m2m.bas_to_fr(asr_text)
+                        else:
+                            question_fr = asr_text
+
+                        # LLaVA describe (require an image; if none, fallback)
+                        if img_bytes:
+                            try:
+                                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                                fr_text = llava.describe_image(img, question_fr=question_fr)
+                            except Exception:
+                                fr_text = "Je ne suis pas sûr."
+                        else:
+                            fr_text = "Je ne suis pas sûr."
+
+                        lg_text = m2m.fr_to_bas(fr_text)
+
+                        await websocket.send_text(json.dumps(
+                            {"fr": fr_text, "lg": lg_text, "asr": asr_text},
+                            ensure_ascii=False
+                        ))
+
+                        wav = tts.tts(lg_text)
+                        await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
+
+                        # reset for next turn
+                        buf_audio.clear()
+                        img_bytes = None
+                        vision_mode = False
+                    else:
+                        if _is_vision_hint(txt):
+                            vision_mode = True
+                        else:
+                            maybe = _maybe_lang(txt)
+                            if maybe: cur_lang = maybe
+            elif msg["type"] == "websocket.disconnect":
+                break
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        await send_json(websocket, "error", message=str(e))
+
 # ---------------------- AUDIO STREAM (OPTIONAL) --------------------
 @app.websocket("/ws/audio_chat_stream")
 async def ws_audio_chat_stream(
     websocket: WebSocket,
-    mode: str = Query("chat"),     # "chat" | "translate"
-    lang: str = Query("fr"),       # "fr" | "en" | "lg"
+    mode: str = Query("chat"),
+    lang: str = Query("fr"),
 ):
-    """
-    Streaming contract (kept for later):
-      1) {"type":"text_line","lang":"fr","text": FR}
-      2) {"type":"pcm_header","sr":24000,"format":"f32le"}
-      3) <binary> f32le chunks (80ms)
-      4) {"type":"wav"}  +  <binary> full WAV
-      5) {"type":"text_line","lang":"lg","text": LG}
-      6) {"type":"text_line","lang":"asr","text": ASR}
-    """
     await websocket.accept()
     buf = bytearray()
     cur_lang = _norm_lang(lang)
