@@ -1,6 +1,6 @@
 # FILE: app/vision_llava.py
 from __future__ import annotations
-import io, json, time
+import io, json, time, os
 from typing import List, Optional
 from PIL import Image
 import torch
@@ -11,17 +11,21 @@ from transformers import (
 )
 
 STRICT_FRENCH_INSTRUCTION = (
-    "Tu es un assistant de vision. Réponds UNIQUEMENT en français, "
-    "en 1 à 2 phrases courtes, sans métadonnées ni balises. "
-    "Décris uniquement ce qui est VISIBLE. "
-    "N'invente pas de détails. Si tu n'es pas sûr, réponds: «Je ne suis pas sûr.»"
+    "Tu es un assistant de vision. Réponds en français en 1 à 2 phrases courtes, "
+    "sans métadonnées ni balises. Décris uniquement ce qui est VISIBLE, de façon précise. "
+    "N'invente pas de détails. Si l'image est entièrement noire/blanche, très floue "
+    "ou ne montre rien de discernable, tu peux répondre : «Je ne suis pas sûr.»"
+)
+
+SOFT_FRENCH_INSTRUCTION = (
+    "Décris brièvement et précisément ce que tu vois sur l'image. "
+    "Réponds en français en 1 à 2 phrases naturelles."
 )
 
 def _maybe_load_chat_template(tok: AutoTokenizer, root: str):
     if getattr(tok, "chat_template", None):
         return
     try:
-        import os, json
         p = os.path.join(root, "chat_template.json")
         if os.path.isfile(p):
             data = json.load(open(p, "r", encoding="utf-8"))
@@ -51,12 +55,13 @@ class LLaVAVideo:
             torch_dtype=self.dtype, device_map="auto"
         ).eval()
 
-    def _build_prompt(self, question_fr: str) -> str:
+    def _build_prompt(self, question_fr: str, strict: bool = True) -> str:
+        instr = STRICT_FRENCH_INSTRUCTION if strict else SOFT_FRENCH_INSTRUCTION
         conv = [{
             "role": "user",
             "content": [
                 {"type": "video"},
-                {"type": "text", "text": f"{STRICT_FRENCH_INSTRUCTION}\n\nQuestion: {question_fr}"},
+                {"type": "text", "text": f"{instr}\n\nQuestion: {question_fr}"},
             ],
         }]
         apply = getattr(self.tokenizer, "apply_chat_template", None) or getattr(self.processor, "apply_chat_template", None)
@@ -65,49 +70,59 @@ class LLaVAVideo:
                 return apply(conv, add_generation_prompt=True, tokenize=False)
             except TypeError:
                 return apply(conv, add_generation_prompt=True)
-        return f"<s>[INST] {STRICT_FRENCH_INSTRUCTION}\n\nQuestion: {question_fr} [/INST]"
+        return f"<s>[INST] {instr}\n\nQuestion: {question_fr} [/INST]"
 
-    @torch.no_grad()
-    def describe_frames(self, frames: List[Image.Image], question_fr: str, max_new_tokens: int = 96) -> str:
-        """
-        frames: list of PIL RGB frames (keep it short, e.g., 6–12)
-        returns: French plain text
-        """
-        prompt = self._build_prompt(question_fr)
-        # Prefer treating frames as a single video; processors sometimes accept either shape
+    def _prep_inputs(self, frames: List[Image.Image], prompt: str):
+        # Try “videos=frames”; some processors also accept videos=[frames]
         try:
             inputs = self.processor(text=prompt, videos=frames, return_tensors="pt")
         except Exception:
             inputs = self.processor(text=prompt, videos=[frames], return_tensors="pt")
 
-        # Pixel values key can vary by processor version; avoid boolean 'or' on tensors
-        pix = inputs.get("pixel_values_videos", None)
-        if pix is None:
-            pix = inputs.get("pixel_values", None)
+        # Which pixel key did we get?
+        pixel_key = None
+        if "pixel_values_videos" in inputs:
+            pixel_key = "pixel_values_videos"
+            pix = inputs["pixel_values_videos"]
+        elif "pixel_values" in inputs:
+            pixel_key = "pixel_values"
+            pix = inputs["pixel_values"]
+        else:
+            raise RuntimeError("Processor did not return pixel values")
+
         if isinstance(pix, list):
             pix = torch.stack(pix, dim=0)
 
-        # DO NOT use tensors in boolean expressions; check explicitly
         input_ids = inputs.get("input_ids", None)
         if (input_ids is None) or (hasattr(input_ids, "nelement") and input_ids.nelement() == 0):
             toks = self.tokenizer(prompt, return_tensors="pt")
             input_ids = toks["input_ids"]
 
-        # Move to device/dtype
         input_ids = input_ids.to(self.model.device)
         pix = pix.to(self.model.device, dtype=self.model.dtype)
+        return input_ids, pix, pixel_key
 
-        out = self.model.generate(
-            input_ids=input_ids,
-            pixel_values_videos=pix,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,          # curb hallucinations
-            temperature=0.0,
-            top_p=1.0,
-            use_cache=True,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+    @torch.no_grad()
+    def _generate(self, input_ids, pix, pixel_key: str, max_new_tokens: int, sample: bool):
+        gen_kwargs = {
+            "input_ids": input_ids,
+            "max_new_tokens": max_new_tokens,
+            "use_cache": True,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+        # attach pixels under the exact key name the model expects
+        gen_kwargs[pixel_key] = pix
+
+        if sample:
+            gen_kwargs.update(dict(do_sample=True, temperature=0.2, top_p=0.9))
+        else:
+            gen_kwargs.update(dict(do_sample=False, temperature=0.0, top_p=1.0))
+
+        out = self.model.generate(**gen_kwargs)
+        return out
+
+    def _post(self, out, prompt: str) -> str:
         text = self.tokenizer.decode(out[0], skip_special_tokens=True).strip()
         if text.startswith(prompt):
             text = text[len(prompt):].strip()
@@ -117,7 +132,25 @@ class LLaVAVideo:
         return text
 
     @torch.no_grad()
+    def describe_frames(self, frames: List[Image.Image], question_fr: str, max_new_tokens: int = 96) -> str:
+        # Pass 1: strict, deterministic
+        prompt = self._build_prompt(question_fr, strict=True)
+        input_ids, pix, pixel_key = self._prep_inputs(frames, prompt)
+        out = self._generate(input_ids, pix, pixel_key, max_new_tokens=max_new_tokens, sample=False)
+        text = self._post(out, prompt)
+
+        low = text.lower()
+        if "je ne suis pas sûr" in low or "je ne suis pas sur" in low:
+            # Pass 2: softer, allow tiny sampling to escape the safety basin
+            prompt2 = self._build_prompt(question_fr, strict=False)
+            input_ids2, pix2, pixel_key2 = self._prep_inputs(frames, prompt2)
+            out2 = self._generate(input_ids2, pix2, pixel_key2, max_new_tokens=max_new_tokens, sample=True)
+            text2 = self._post(out2, prompt2)
+            if text2.strip():
+                text = text2
+        return text
+
+    @torch.no_grad()
     def describe_image(self, img: Image.Image, question_fr: str) -> str:
-        # treat image as a short “video” (repeat few frames)
         frames = [img.convert("RGB")] * 6
         return self.describe_frames(frames, question_fr)
