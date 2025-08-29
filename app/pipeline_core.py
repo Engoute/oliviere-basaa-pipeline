@@ -187,4 +187,4 @@ def labeled_block(asr: str, fr: str, lg: str) -> str:
         parts.append(f"FR: {fr.strip()}")
     if lg.strip():
         parts.append(f"Basaa: {lg.strip()}")
-    return "\n".join(parts)
+    return "\n".join(parts) 
