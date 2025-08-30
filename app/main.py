@@ -27,7 +27,7 @@ from .utils_audio import wav_bytes_from_float32
 # --- extra imports for vision ---
 import io
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from PIL import Image, ImageOps, ImageEnhance
 import av  # PyAV for video parsing
 import torch
@@ -255,7 +255,7 @@ def _split_for_tts(text: str, max_len: int = 240) -> list[str]:
 
 def _is_bad_wave(w: np.ndarray) -> bool:
     if w is None or not isinstance(w, np.ndarray) or w.size == 0:
-        True
+        return True
     if not np.all(np.isfinite(w)):
         return True
     if w.shape[0] < int(0.10 * TTS.sr_out):  # <100ms, use actual Orpheus SR
@@ -344,7 +344,13 @@ async def ws_chat_text(ws: WebSocket):
 
         src     = MT.resolve_safe_src(user_text, src_hint or None)
         user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
-        qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+
+        # Tiny heuristic: if it's just a greeting, answer naturally instead of "how can I help?"
+        if re.search(r"\b(bonjour|salut|bonsoir)\b", user_fr, flags=re.I) and re.search(r"\b(comment\s*(ça|ca)\s*va|tu vas)\b", user_fr, flags=re.I):
+            qwen_fr = "Je vais bien, merci ! Et toi, ça va ?"
+        else:
+            qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+
         basaa   = MT.to_lg(qwen_fr, "fr")
 
         await ws.send_text(json.dumps({"fr": qwen_fr, "lg": basaa}, ensure_ascii=False))
@@ -359,9 +365,7 @@ async def ws_tts_once(ws: WebSocket):
     await ws.accept()
     try:
         text = (await ws.receive_text()).strip()
-        # Keep safety/cleanup for this endpoint if you want; main focus is audio_chat path.
         wav = synthesize_wav_safe(text)
-        # IMPORTANT: write WAV with the Orpheus SR to avoid resample/pitch issues
         wav_bytes = wav_bytes_from_float32(wav, TTS.sr_out)
         try:
             await ws.send_bytes(wav_bytes)
@@ -373,25 +377,43 @@ async def ws_tts_once(ws: WebSocket):
         await _safe_close(ws)
 
 # ---- helpers for audio sockets: read JSON header then bytes ---------------
-async def _read_audio_and_header(ws: WebSocket):
+async def _read_audio_and_header(ws: WebSocket) -> Tuple[bytes, Optional[str], Optional[str]]:
+    """
+    Collects audio bytes + optional {'lang':...} + optional {'text':...} override.
+    Ends when the client sends "DONE" (or {"type":"stop"}).
+    Returns: (audio_bytes, lang_hint, text_override)
+    """
     buf = bytearray()
-    lang_hint = None
+    lang_hint: Optional[str] = None
+    typed_text: Optional[str] = None
 
     try:
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.receive":
-                if "text" in msg:
+                if "text" in msg and msg["text"] is not None:
                     txt = (msg.get("text") or "").strip()
                     if not txt:
                         continue
+                    # stop?
+                    try:
+                        obj = json.loads(txt)
+                        if isinstance(obj, dict) and str(obj.get("type","")).lower() == "stop":
+                            break
+                    except Exception:
+                        pass
                     if txt.upper() == "DONE":
                         break
+                    # parse fields
                     try:
                         obj = json.loads(txt)
                         if isinstance(obj, dict):
-                            lang_hint = (obj.get("lang") or obj.get("src") or lang_hint)
+                            if obj.get("lang"):
+                                lang_hint = (obj.get("lang") or obj.get("src") or lang_hint)
+                            if isinstance(obj.get("text"), str) and obj["text"].strip():
+                                typed_text = obj["text"].strip()
                     except Exception:
+                        # ignore non-JSON status lines
                         pass
                 elif "bytes" in msg and msg["bytes"]:
                     buf.extend(msg["bytes"])
@@ -402,17 +424,22 @@ async def _read_audio_and_header(ws: WebSocket):
     except Exception:
         traceback.print_exc()
 
-    return bytes(buf), (lang_hint or "").lower().strip() or None
+    lang_hint = (lang_hint or "").lower().strip() or None
+    return bytes(buf), lang_hint, typed_text
 
 # -------------------- non-streaming audio: translate -----------------------
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
     await ws.accept()
-    audio, lang_hint = await _read_audio_and_header(ws)
+    audio, lang_hint, typed = await _read_audio_and_header(ws)
 
     try:
-        text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
-        src = MT.resolve_safe_src(text, lang_hint or wlang)
+        if typed and typed.strip():
+            text = typed.strip()
+            src = MT.resolve_safe_src(text, lang_hint or None)
+        else:
+            text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
+            src = MT.resolve_safe_src(text, lang_hint or wlang)
 
         fr_text = MT.to_fr(text, src)
         lg_text = MT.to_lg(text, src)
@@ -423,7 +450,6 @@ async def ws_translate(ws: WebSocket):
         ))
 
         wav = synthesize_wav_safe(lg_text)
-        # Use Orpheus SR
         wav_bytes = wav_bytes_from_float32(wav, TTS.sr_out)
         try:
             await ws.send_bytes(wav_bytes)
@@ -438,19 +464,30 @@ async def ws_translate(ws: WebSocket):
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(ws: WebSocket):
     """
-    RESTORED: bit-for-bit Orpheus output for the chat reply.
-    - No text cleanup/normalization here.
-    - WAV header uses TTS.sr_out to avoid any resample/pitch drift.
+    RESTORED + EXTENDED:
+      - Honors a text override: client can send {"text":"..."} then "DONE".
+      - If no text, falls back to ASR on the audio payload.
+      - WAV header uses TTS.sr_out to avoid resample/pitch drift.
     """
     await ws.accept()
-    audio, lang_hint = await _read_audio_and_header(ws)
+    audio, lang_hint, typed = await _read_audio_and_header(ws)
 
     try:
-        user_text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
-        src     = MT.resolve_safe_src(user_text, lang_hint or wlang)
-        user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
+        if typed and typed.strip():
+            user_text = typed.strip()
+            src = MT.resolve_safe_src(user_text, lang_hint or None)
+            user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
+        else:
+            user_text, wlang, _ = ASR_MODEL.transcribe(audio, lang_hint=lang_hint)
+            src     = MT.resolve_safe_src(user_text, lang_hint or wlang)
+            user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
 
-        qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+        # Greeting micro-heuristic (less “comment puis-je aider ?” on greetings)
+        if re.search(r"\b(bonjour|salut|bonsoir)\b", user_fr, flags=re.I) and re.search(r"\b(comment\s*(ça|ca)\s*va|tu vas)\b", user_fr, flags=re.I):
+            qwen_fr = "Je vais bien, merci ! Et toi, ça va ?"
+        else:
+            qwen_fr = QWEN.chat_fr(user_fr, temperature=0.2)
+
         basaa   = MT.to_lg(qwen_fr, "fr")
 
         await ws.send_text(json.dumps(
@@ -458,7 +495,7 @@ async def ws_audio_chat(ws: WebSocket):
             ensure_ascii=False
         ))
 
-        # CRITICAL: call Orpheus directly without normalization/splitting.
+        # Orpheus direct (no text normalization here)
         wav = TTS.tts(basaa)
         wav_bytes = wav_bytes_from_float32(wav, TTS.sr_out)
         try:
