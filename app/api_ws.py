@@ -65,14 +65,12 @@ def _norm_lang(s: Optional[str]) -> str:
     Accepts BCP-47 variants (e.g., en-US), common aliases, and fallbacks.
     """
     s = (s or "fr").strip().lower()
-    # strip region/script like "en-us" / "en_US" -> "en"
     for sep in ("-", "_"):
         if sep in s:
             s = s.split(sep, 1)[0]
             break
     if s in ("lg", "bas", "basaa"): return "lg"
     if s in ("en", "eng"): return "en"
-    # default French
     return "fr"
 
 def _is_stop(payload: str) -> bool:
@@ -95,14 +93,10 @@ def _maybe_lang(payload: str) -> Optional[str]:
         data = json.loads(payload)
         if not isinstance(data, dict):
             return None
-
-        # top-level
         if isinstance(data.get("lang"), str):
             return _norm_lang(data["lang"])
         if isinstance(data.get("src"), str):
             return _norm_lang(data["src"])
-
-        # nested ASR object
         asr = data.get("asr")
         if isinstance(asr, dict):
             for key in ("language", "lang", "src"):
@@ -145,7 +139,6 @@ async def ws_chat_text(websocket: WebSocket):
                 continue
 
             user_text = str(data["text"]).strip()
-            # also accept language via nested asr.language for parity with audio routes
             src = _norm_lang(
                 data.get("lang")
                 or data.get("src")
@@ -183,7 +176,6 @@ async def ws_translate_text(websocket: WebSocket):
                 await send_json(websocket, "error", message="bad payload")
                 continue
 
-            # also accept language via nested asr.language for parity with audio routes
             src = _norm_lang(
                 data.get("src")
                 or data.get("lang")
