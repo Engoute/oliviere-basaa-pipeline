@@ -1,11 +1,9 @@
-# FILE: app/tts_orpheus.py
 from __future__ import annotations
 
 import os
 import json
-import re
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable, Iterable
+from typing import Optional, List, Tuple, Iterable
 
 import numpy as np
 import torch
@@ -53,17 +51,17 @@ class Orpheus:
         temperature: float = 0.65,
         top_p: float = 0.94,
         repetition_penalty: float = 1.12,
+        tail_pad_ms: int = 60,          # ← safety pad to avoid playback cutoff
         device: Optional[str] = None,
-        tail_pad_ms: int = 60,  # ← tiny safety pad to avoid cut-offs on playback
     ):
-        self.sr_out = int(sr_out)
+        self.sr_out = int(sr_out)       # ← LOCKED; do NOT override from config
         self.voice_name = voice_name
         self.code_offset = int(audio_code_offset)
         self.min_frames = int(min_frames)
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.repetition_penalty = float(repetition_penalty)
-        self.tail_pad_ms = int(max(0, tail_pad_ms))
+        self.tail_pad_ms = int(tail_pad_ms)
 
         # Device + dtype
         if device is None:
@@ -115,25 +113,23 @@ class Orpheus:
         # SNAC vocoder
         self.snac = SNAC.from_pretrained(vocoder_dir).to(self.device).eval()
 
-        # Derive FPS & sampling rate from vocoder config when present
+        # Only use vocoder config to estimate frames/sec; DO NOT change sr_out here.
         try:
             with open(os.path.join(vocoder_dir, "config.json"), "r", encoding="utf-8") as f:
                 vcfg = json.load(f)
-            sr = int(vcfg.get("sampling_rate", self.sr_out))
             hop = vcfg.get("hop_length")
-            self.frames_per_sec = (sr / hop) if hop else 75.0
-            self.sr_out = sr  # honor vocoder sr
+            sr_cfg = vcfg.get("sampling_rate")
+            self.frames_per_sec = (sr_cfg / hop) if (sr_cfg and hop) else 75.0
         except Exception:
             self.frames_per_sec = 75.0
 
-        print(f"[tts] Orpheus ready (sr={self.sr_out} Hz, device={self.device})")
+        print(f"[tts] Orpheus ready (sr_out={self.sr_out} Hz locked, device={self.device})")
 
     # ---------- robust, non-streaming TTS ----------
     @torch.no_grad()
     def tts(self, basaa_text: str, max_new_audio_tokens: Optional[int] = None) -> np.ndarray:
         """
-        Generate full waveform (float32 mono, [-1..1], sr_out).
-        Adds a tiny tail pad to reduce risk of client-side cutoff.
+        Generate full waveform (float32 mono, [-1..1], sr_out), add tiny tail pad.
         """
         prompt = self._format_prompt(basaa_text)
         enc = self.tok(prompt, return_tensors="pt")
@@ -162,18 +158,29 @@ class Orpheus:
             return np.zeros((self.sr_out // 20,), dtype=np.float32)
 
         codes, _ = self._decode_llm_tokens_to_snac_codes(tail, self.code_offset, self.min_frames)
-        wav = self.snac.decode(codes)  # [1, T] or similar
+        wav = self.snac.decode(codes)  # tensor [C,T] or [1,T]
         wav = torch.clamp(wav, -1, 1).contiguous()
-        wav = _to_channels_time(wav).to(torch.float32)
-        if wav.shape[0] != 1:
-            wav = wav.mean(dim=0, keepdim=True)
+        wav = _to_channels_time(wav).mean(dim=0, keepdim=True)  # mono
         if wav.shape[1] == 0:
             return np.zeros((self.sr_out // 20,), dtype=np.float32)
-        out = wav.squeeze(0).cpu().numpy().astype(np.float32)
 
-        # Small fade-out + safety pad at tail to prevent click/cut-off
-        out = self._apply_tail_safety_pad(out)
-        return out
+        # Gentle limiter
+        peak = float(torch.max(torch.abs(wav)))
+        if peak > 0.99:
+            wav = wav * (0.99 / peak)
+
+        # Add tiny tail pad with fade-out (prevents last syllable from being clipped)
+        if self.tail_pad_ms > 0:
+            pad_len = max(1, int(self.sr_out * (self.tail_pad_ms / 1000.0)))
+            if pad_len < 256:
+                pad_len = 256
+            fade = torch.linspace(1.0, 0.0, pad_len, dtype=wav.dtype, device=wav.device).unsqueeze(0)
+            tail_pad = torch.zeros_like(fade)
+            # stitch: last samples blend into silence
+            wav = torch.cat([wav, tail_pad], dim=1)
+            wav[:, -pad_len:] = wav[:, -pad_len:] * fade
+
+        return wav.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
     # ---------- streaming by slicing the final WAV ----------
     def iter_pcm_stream(
@@ -210,25 +217,10 @@ class Orpheus:
         return f"{bos}<|voice|>{self.voice_name}<|text|>{text}{eos}<|audio|>"
 
     def _estimate_max_tokens_from_text(self, text: str) -> int:
-        # Slightly more generous estimate + fixed guard band to avoid short audio
-        n_words = max(1, len(re.findall(r"\w+", text)))
-        rough = n_words * 38 + 56
-        return int(max(9 * self.min_frames, min(4 * 4096, rough)))
-
-    def _apply_tail_safety_pad(self, wav: np.ndarray, pad_ms: Optional[int] = None) -> np.ndarray:
-        pad_ms = self.tail_pad_ms if pad_ms is None else int(max(0, pad_ms))
-        if pad_ms <= 0 or wav.size == 0:
-            return wav
-        # short fade-out to zero over ~5 ms (avoid clicks)
-        fade = int(min(max(1, self.sr_out // 200), wav.size))  # ~5ms
-        if fade > 0:
-            ramp = np.linspace(1.0, 0.0, fade, dtype=np.float32)
-            wav[-fade:] *= ramp
-        n = int(self.sr_out * (pad_ms / 1000.0))
-        if n <= 0:
-            return wav
-        pad = np.zeros(n, dtype=np.float32)
-        return np.concatenate([wav, pad], dtype=np.float32)
+        # More generous budget so phrases don’t truncate
+        n_words = max(1, len(text.split()))
+        rough = n_words * 40
+        return int(max(7 * self.min_frames, min(4 * 4096, rough)))
 
     @staticmethod
     def _decode_llm_tokens_to_snac_codes(
