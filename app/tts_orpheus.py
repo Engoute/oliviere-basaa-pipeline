@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from pathlib import Path
 from typing import Optional, List, Tuple, Callable, Iterable
 
@@ -53,6 +54,7 @@ class Orpheus:
         top_p: float = 0.94,
         repetition_penalty: float = 1.12,
         device: Optional[str] = None,
+        tail_pad_ms: int = 60,  # ← tiny safety pad to avoid cut-offs on playback
     ):
         self.sr_out = int(sr_out)
         self.voice_name = voice_name
@@ -61,6 +63,7 @@ class Orpheus:
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.repetition_penalty = float(repetition_penalty)
+        self.tail_pad_ms = int(max(0, tail_pad_ms))
 
         # Device + dtype
         if device is None:
@@ -130,6 +133,7 @@ class Orpheus:
     def tts(self, basaa_text: str, max_new_audio_tokens: Optional[int] = None) -> np.ndarray:
         """
         Generate full waveform (float32 mono, [-1..1], sr_out).
+        Adds a tiny tail pad to reduce risk of client-side cutoff.
         """
         prompt = self._format_prompt(basaa_text)
         enc = self.tok(prompt, return_tensors="pt")
@@ -165,7 +169,11 @@ class Orpheus:
             wav = wav.mean(dim=0, keepdim=True)
         if wav.shape[1] == 0:
             return np.zeros((self.sr_out // 20,), dtype=np.float32)
-        return wav.squeeze(0).cpu().numpy().astype(np.float32)
+        out = wav.squeeze(0).cpu().numpy().astype(np.float32)
+
+        # Small fade-out + safety pad at tail to prevent click/cut-off
+        out = self._apply_tail_safety_pad(out)
+        return out
 
     # ---------- streaming by slicing the final WAV ----------
     def iter_pcm_stream(
@@ -202,9 +210,25 @@ class Orpheus:
         return f"{bos}<|voice|>{self.voice_name}<|text|>{text}{eos}<|audio|>"
 
     def _estimate_max_tokens_from_text(self, text: str) -> int:
-        n_words = max(1, len(text.split()))
-        rough = n_words * 33
-        return int(max(7 * self.min_frames, min(4 * 4096, rough)))
+        # Slightly more generous estimate + fixed guard band to avoid short audio
+        n_words = max(1, len(re.findall(r"\w+", text)))
+        rough = n_words * 38 + 56
+        return int(max(9 * self.min_frames, min(4 * 4096, rough)))
+
+    def _apply_tail_safety_pad(self, wav: np.ndarray, pad_ms: Optional[int] = None) -> np.ndarray:
+        pad_ms = self.tail_pad_ms if pad_ms is None else int(max(0, pad_ms))
+        if pad_ms <= 0 or wav.size == 0:
+            return wav
+        # short fade-out to zero over ~5 ms (avoid clicks)
+        fade = int(min(max(1, self.sr_out // 200), wav.size))  # ~5ms
+        if fade > 0:
+            ramp = np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            wav[-fade:] *= ramp
+        n = int(self.sr_out * (pad_ms / 1000.0))
+        if n <= 0:
+            return wav
+        pad = np.zeros(n, dtype=np.float32)
+        return np.concatenate([wav, pad], dtype=np.float32)
 
     @staticmethod
     def _decode_llm_tokens_to_snac_codes(
