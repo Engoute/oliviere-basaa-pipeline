@@ -1,4 +1,3 @@
-# FILE: api-ws.py
 from __future__ import annotations
 import asyncio, json, os, io
 from typing import Optional
@@ -43,7 +42,7 @@ def services():
     if _tts_orpheus is None:
         _tts_orpheus = Orpheus(
             os.environ.get("PATH_ORPHEUS", "/data/models/orpheus_bundle"),
-            sr_out=24000,
+            sr_out=24000,                                      # ← lock 24 kHz
             voice_name=os.environ.get("ORPHEUS_VOICE", "basaa_speaker"),
         )
     if _llava is None:
@@ -60,18 +59,25 @@ async def root():
 
 # --------------------------- helpers ---------------------------
 def _norm_lang(s: Optional[str]) -> str:
-    """
-    Normalize language hints to one of: "fr", "en", "lg"
-    Accepts BCP-47 variants (e.g., en-US), common aliases, and fallbacks.
-    """
-    s = (s or "fr").strip().lower()
-    for sep in ("-", "_"):
-        if sep in s:
-            s = s.split(sep, 1)[0]
-            break
-    if s in ("lg", "bas", "basaa"): return "lg"
-    if s in ("en", "eng"): return "en"
+    s = (s or "fr").lower().strip()
+    if s in ("lg","bas","basaa"): return "lg"
+    if s == "en": return "en"
     return "fr"
+
+def _extract_lang_any(obj: dict) -> Optional[str]:
+    # honor nested asr.language / asr.lang / asr.src and top-level lang/src
+    if not isinstance(obj, dict): return None
+    for k in ("language","lang","src"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return _norm_lang(v)
+    asr = obj.get("asr")
+    if isinstance(asr, dict):
+        for k in ("language","lang","src"):
+            v = asr.get(k)
+            if isinstance(v, str) and v.strip():
+                return _norm_lang(v)
+    return None
 
 def _is_stop(payload: str) -> bool:
     try:
@@ -83,44 +89,22 @@ def _is_stop(payload: str) -> bool:
     return payload.strip().upper() == "DONE"
 
 def _maybe_lang(payload: str) -> Optional[str]:
-    """
-    Extract language hint from:
-      - {"lang": "..."} or {"src":"..."}
-      - {"asr":{"language":"..."}}
-      - also accepts {"asr":{"lang":"..."}}, {"asr":{"src":"..."}}
-    """
     try:
         data = json.loads(payload)
-        if not isinstance(data, dict):
-            return None
-        if isinstance(data.get("lang"), str):
-            return _norm_lang(data["lang"])
-        if isinstance(data.get("src"), str):
-            return _norm_lang(data["src"])
-        asr = data.get("asr")
-        if isinstance(asr, dict):
-            for key in ("language", "lang", "src"):
-                if isinstance(asr.get(key), str):
-                    return _norm_lang(asr[key])
+        if isinstance(data, dict):
+            got = _extract_lang_any(data)
+            if got: return got
     except Exception:
         pass
     return None
 
 def _maybe_text(payload: str) -> Optional[str]:
-    """
-    Extract a typed text override from:
-      - {"text":"..."}
-      - {"asr":{"text":"..."}}
-    """
     try:
         data = json.loads(payload)
-        if isinstance(data, dict):
-            if isinstance(data.get("text"), str) and data["text"].strip():
-                return data["text"].strip()
-            asr = data.get("asr")
-            if isinstance(asr, dict) and isinstance(asr.get("text"), str):
-                t = asr["text"].strip()
-                if t: return t
+        if isinstance(data, dict) and isinstance(data.get("text"), str):
+            t = data["text"].strip()
+            if t:
+                return t
     except Exception:
         pass
     return None
@@ -139,13 +123,7 @@ async def ws_chat_text(websocket: WebSocket):
                 continue
 
             user_text = str(data["text"]).strip()
-            src = _norm_lang(
-                data.get("lang")
-                or data.get("src")
-                or (isinstance(data.get("asr"), dict) and data["asr"].get("language"))
-                or (isinstance(data.get("asr"), dict) and data["asr"].get("lang"))
-                or (isinstance(data.get("asr"), dict) and data["asr"].get("src"))
-            )
+            src = _extract_lang_any(data) or _norm_lang(data.get("lang") or data.get("src"))
 
             if src == "en":
                 prompt_fr = llm.en_to_fr(user_text)
@@ -176,13 +154,7 @@ async def ws_translate_text(websocket: WebSocket):
                 await send_json(websocket, "error", message="bad payload")
                 continue
 
-            src = _norm_lang(
-                data.get("src")
-                or data.get("lang")
-                or (isinstance(data.get("asr"), dict) and data["asr"].get("language"))
-                or (isinstance(data.get("asr"), dict) and data["asr"].get("lang"))
-                or (isinstance(data.get("asr"), dict) and data["asr"].get("src"))
-            )
+            src = _extract_lang_any(data) or _norm_lang(data.get("src") or data.get("lang"))
             text = str(data["text"]).strip()
 
             if src == "en":
@@ -217,7 +189,7 @@ async def ws_tts_once(websocket: WebSocket):
             if not text:
                 await send_json(websocket, "error", message="missing text")
                 continue
-            wav = tts.tts(text)
+            wav = tts.tts(text)  # already adds safety pad
             await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
     except WebSocketDisconnect:
         return
@@ -228,10 +200,7 @@ async def ws_tts_once(websocket: WebSocket):
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(websocket: WebSocket):
     """
-    Now accepts a TEXT override: client may send {"text":"..."} before DONE
-    to bypass ASR. This matches your ChatPage handshake.
-
-    (Compat) Also honors nested {"asr":{"language":"fr|en|lg"}} pins.
+    Accepts optional {"text":"..."} override and nested {"asr":{"language":".."}} pins.
     """
     await websocket.accept()
     buf = bytearray()
@@ -285,17 +254,27 @@ async def ws_audio_chat(websocket: WebSocket):
                             ensure_ascii=False
                         ))
 
-                        wav = tts.tts(lg_text)
+                        wav = tts.tts(lg_text)  # full length + tail pad
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
                         buf.clear(); typed_text = None
                     else:
-                        maybe = _maybe_lang(txt)
-                        if maybe:
-                            cur_lang = maybe
-                        else:
-                            t = _maybe_text(txt)
-                            if t: typed_text = t
+                        # allow nested asr.language pins and text overrides
+                        try:
+                            obj = json.loads(txt)
+                            maybe = _extract_lang_any(obj)
+                            if maybe:
+                                cur_lang = maybe
+                            t = obj.get("text")
+                            if isinstance(t, str) and t.strip():
+                                typed_text = t.strip()
+                        except Exception:
+                            maybe = _maybe_lang(txt)
+                            if maybe:
+                                cur_lang = maybe
+                            else:
+                                t = _maybe_text(txt)
+                                if t: typed_text = t
             elif msg["type"] == "websocket.disconnect":
                 break
     except WebSocketDisconnect:
@@ -307,8 +286,7 @@ async def ws_audio_chat(websocket: WebSocket):
 @app.websocket("/ws/translate")
 async def ws_translate(websocket: WebSocket):
     """
-    Also accepts a TEXT override for parity with audio_chat.
-    (Compat) Honors nested {"asr":{"language":"fr|en|lg"}} pins.
+    Also accepts a TEXT override and nested asr.language pins.
     """
     await websocket.accept()
     buf = bytearray()
@@ -354,16 +332,24 @@ async def ws_translate(websocket: WebSocket):
                             ensure_ascii=False
                         ))
 
-                        wav = tts.tts(lg_text)
+                        wav = tts.tts(lg_text)  # full length + tail pad
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
                         buf.clear(); typed_text = None
                     else:
-                        maybe = _maybe_lang(txt)
-                        if maybe: cur_lang = maybe
-                        else:
-                            t = _maybe_text(txt)
-                            if t: typed_text = t
+                        try:
+                            obj = json.loads(txt)
+                            maybe = _extract_lang_any(obj)
+                            if maybe: cur_lang = maybe
+                            t = obj.get("text")
+                            if isinstance(t, str) and t.strip():
+                                typed_text = t.strip()
+                        except Exception:
+                            maybe = _maybe_lang(txt)
+                            if maybe: cur_lang = maybe
+                            else:
+                                t = _maybe_text(txt)
+                                if t: typed_text = t
             elif msg["type"] == "websocket.disconnect":
                 break
     except WebSocketDisconnect:
@@ -417,13 +403,12 @@ async def ws_vision_once(websocket: WebSocket):
 
                         lang = _norm_lang(cur_lang)
                         if lang in ("fr","en"):
-                            asr_text = asr_general.transcribe(x16, lang=lang)   # ← forced language
-                            question_fr = asr_text  # English is OK; LLaVA prompt enforces FR output
+                            asr_text = asr_general.transcribe(x16, lang=lang)
+                            question_fr = asr_text
                         else:
                             asr_text = asr_basaa.transcribe(x16)
                             question_fr = m2m.bas_to_fr(asr_text)
 
-                        # Decode image (required)
                         if not image_bytes:
                             await send_json(websocket, "error", message="missing image")
                             audio_buf.clear()
@@ -435,40 +420,36 @@ async def ws_vision_once(websocket: WebSocket):
                             audio_buf.clear()
                             continue
 
-                        # LLaVA French description (strict FR, low hallucination)
                         try:
                             fr_text = llava.describe_image(img, question_fr)
                         except Exception as e:
                             await send_json(websocket, "error", message=f"vision_failed: {type(e).__name__}: {e}")
                             return
 
-                        # Basaa text from French
                         lg_text = m2m.fr_to_bas(fr_text)
 
-                        # Send pair
                         await websocket.send_text(json.dumps(
                             {"fr": fr_text, "lg": lg_text, "asr": asr_text},
                             ensure_ascii=False
                         ))
 
-                        # TTS Basaa
                         wav = tts.tts(lg_text)
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
                         audio_buf.clear()
                         image_bytes = None
                     else:
-                        # language or vision hint
-                        maybe = _maybe_lang(txt)
-                        if maybe:
-                            cur_lang = maybe
-                        else:
-                            try:
-                                data = json.loads(txt)
-                                if isinstance(data, dict) and data.get("vision") is True:
-                                    want_image_next = True
-                            except Exception:
-                                pass
+                        try:
+                            data = json.loads(txt)
+                            maybe = _extract_lang_any(data)
+                            if maybe:
+                                cur_lang = maybe
+                            elif isinstance(data, dict) and data.get("vision") is True:
+                                want_image_next = True
+                        except Exception:
+                            maybe = _maybe_lang(txt)
+                            if maybe:
+                                cur_lang = maybe
 
             elif typ == "websocket.disconnect":
                 break
