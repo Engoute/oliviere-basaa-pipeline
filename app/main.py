@@ -1,3 +1,4 @@
+# FILE: app/main.py
 from __future__ import annotations
 
 # --- IMPORTANT: block torchvision before transformers loads anywhere ---
@@ -298,6 +299,7 @@ def synthesize_wav_safe(text: str) -> np.ndarray:
         peak = float(np.max(np.abs(out)))
         if peak > 0.99:
             out = out * (0.99 / peak)
+    # no extra trim; Orpheus already adds a tiny tail pad
     return out
 
 # --------------------------------------------------------------------------
@@ -317,7 +319,11 @@ async def ws_translate_text(ws: WebSocket):
             payload = {"text": payload_raw}
 
         text = (payload.get("text") or "").strip()
-        src_hint = (payload.get("lang") or payload.get("src") or "").strip().lower()
+        # honor nested ASR language pins too
+        asr_obj = payload.get("asr") if isinstance(payload, dict) else None
+        src_hint = (payload.get("lang") or payload.get("src") or
+                    (isinstance(asr_obj, dict) and (asr_obj.get("language") or asr_obj.get("lang") or asr_obj.get("src"))) or
+                    "").strip().lower()
 
         src = MT.resolve_safe_src(text, src_hint or None)
         out_fr = MT.to_fr(text, src)
@@ -340,7 +346,10 @@ async def ws_chat_text(ws: WebSocket):
             payload = {"text": payload_raw}
 
         user_text = (payload.get("text") or "").strip()
-        src_hint  = (payload.get("lang") or payload.get("src") or "").strip().lower()
+        asr_obj  = payload.get("asr") if isinstance(payload, dict) else None
+        src_hint  = (payload.get("lang") or payload.get("src") or
+                     (isinstance(asr_obj, dict) and (asr_obj.get("language") or asr_obj.get("lang") or asr_obj.get("src"))) or
+                     "").strip().lower()
 
         src     = MT.resolve_safe_src(user_text, src_hint or None)
         user_fr = user_text if src == "fr" else MT.to_fr(user_text, src)
@@ -379,7 +388,8 @@ async def ws_tts_once(ws: WebSocket):
 # ---- helpers for audio sockets: read JSON header then bytes ---------------
 async def _read_audio_and_header(ws: WebSocket) -> Tuple[bytes, Optional[str], Optional[str]]:
     """
-    Collects audio bytes + optional {'lang':...} + optional {'text':...} override.
+    Collects audio bytes + optional {'lang'| 'src'} or nested {'asr': {'language'|'lang'|'src'}} +
+    optional {'text'} or {'asr': {'text'}} override.
     Ends when the client sends "DONE" (or {"type":"stop"}).
     Returns: (audio_bytes, lang_hint, text_override)
     """
@@ -410,6 +420,19 @@ async def _read_audio_and_header(ws: WebSocket) -> Tuple[bytes, Optional[str], O
                         if isinstance(obj, dict):
                             if obj.get("lang"):
                                 lang_hint = (obj.get("lang") or obj.get("src") or lang_hint)
+                            if obj.get("src"):
+                                lang_hint = (obj.get("src") or lang_hint)
+                            # nested ASR
+                            asr = obj.get("asr")
+                            if isinstance(asr, dict):
+                                if asr.get("language"):
+                                    lang_hint = asr.get("language")
+                                elif asr.get("lang"):
+                                    lang_hint = asr.get("lang")
+                                elif asr.get("src"):
+                                    lang_hint = asr.get("src")
+                                if isinstance(asr.get("text"), str) and asr["text"].strip():
+                                    typed_text = asr["text"].strip()
                             if isinstance(obj.get("text"), str) and obj["text"].strip():
                                 typed_text = obj["text"].strip()
                     except Exception:
