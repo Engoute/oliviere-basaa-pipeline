@@ -60,9 +60,19 @@ async def root():
 
 # --------------------------- helpers ---------------------------
 def _norm_lang(s: Optional[str]) -> str:
-    s = (s or "fr").lower().strip()
-    if s in ("lg","bas","basaa"): return "lg"
-    if s == "en": return "en"
+    """
+    Normalize language hints to one of: "fr", "en", "lg"
+    Accepts BCP-47 variants (e.g., en-US), common aliases, and fallbacks.
+    """
+    s = (s or "fr").strip().lower()
+    # strip region/script like "en-us" / "en_US" -> "en"
+    for sep in ("-", "_"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+            break
+    if s in ("lg", "bas", "basaa"): return "lg"
+    if s in ("en", "eng"): return "en"
+    # default French
     return "fr"
 
 def _is_stop(payload: str) -> bool:
@@ -75,21 +85,48 @@ def _is_stop(payload: str) -> bool:
     return payload.strip().upper() == "DONE"
 
 def _maybe_lang(payload: str) -> Optional[str]:
+    """
+    Extract language hint from:
+      - {"lang": "..."} or {"src":"..."}
+      - {"asr":{"language":"..."}}
+      - also accepts {"asr":{"lang":"..."}}, {"asr":{"src":"..."}}
+    """
     try:
         data = json.loads(payload)
-        if isinstance(data, dict) and "lang" in data and isinstance(data["lang"], str):
+        if not isinstance(data, dict):
+            return None
+
+        # top-level
+        if isinstance(data.get("lang"), str):
             return _norm_lang(data["lang"])
+        if isinstance(data.get("src"), str):
+            return _norm_lang(data["src"])
+
+        # nested ASR object
+        asr = data.get("asr")
+        if isinstance(asr, dict):
+            for key in ("language", "lang", "src"):
+                if isinstance(asr.get(key), str):
+                    return _norm_lang(asr[key])
     except Exception:
         pass
     return None
 
 def _maybe_text(payload: str) -> Optional[str]:
+    """
+    Extract a typed text override from:
+      - {"text":"..."}
+      - {"asr":{"text":"..."}}
+    """
     try:
         data = json.loads(payload)
-        if isinstance(data, dict) and isinstance(data.get("text"), str):
-            t = data["text"].strip()
-            if t:
-                return t
+        if isinstance(data, dict):
+            if isinstance(data.get("text"), str) and data["text"].strip():
+                return data["text"].strip()
+            asr = data.get("asr")
+            if isinstance(asr, dict) and isinstance(asr.get("text"), str):
+                t = asr["text"].strip()
+                if t: return t
     except Exception:
         pass
     return None
@@ -108,7 +145,14 @@ async def ws_chat_text(websocket: WebSocket):
                 continue
 
             user_text = str(data["text"]).strip()
-            src = _norm_lang(data.get("lang") or data.get("src"))
+            # also accept language via nested asr.language for parity with audio routes
+            src = _norm_lang(
+                data.get("lang")
+                or data.get("src")
+                or (isinstance(data.get("asr"), dict) and data["asr"].get("language"))
+                or (isinstance(data.get("asr"), dict) and data["asr"].get("lang"))
+                or (isinstance(data.get("asr"), dict) and data["asr"].get("src"))
+            )
 
             if src == "en":
                 prompt_fr = llm.en_to_fr(user_text)
@@ -139,7 +183,14 @@ async def ws_translate_text(websocket: WebSocket):
                 await send_json(websocket, "error", message="bad payload")
                 continue
 
-            src = _norm_lang(data.get("src") or data.get("lang"))
+            # also accept language via nested asr.language for parity with audio routes
+            src = _norm_lang(
+                data.get("src")
+                or data.get("lang")
+                or (isinstance(data.get("asr"), dict) and data["asr"].get("language"))
+                or (isinstance(data.get("asr"), dict) and data["asr"].get("lang"))
+                or (isinstance(data.get("asr"), dict) and data["asr"].get("src"))
+            )
             text = str(data["text"]).strip()
 
             if src == "en":
@@ -187,6 +238,8 @@ async def ws_audio_chat(websocket: WebSocket):
     """
     Now accepts a TEXT override: client may send {"text":"..."} before DONE
     to bypass ASR. This matches your ChatPage handshake.
+
+    (Compat) Also honors nested {"asr":{"language":"fr|en|lg"}} pins.
     """
     await websocket.accept()
     buf = bytearray()
@@ -263,6 +316,7 @@ async def ws_audio_chat(websocket: WebSocket):
 async def ws_translate(websocket: WebSocket):
     """
     Also accepts a TEXT override for parity with audio_chat.
+    (Compat) Honors nested {"asr":{"language":"fr|en|lg"}} pins.
     """
     await websocket.accept()
     buf = bytearray()
