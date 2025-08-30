@@ -83,6 +83,17 @@ def _maybe_lang(payload: str) -> Optional[str]:
         pass
     return None
 
+def _maybe_text(payload: str) -> Optional[str]:
+    try:
+        data = json.loads(payload)
+        if isinstance(data, dict) and isinstance(data.get("text"), str):
+            t = data["text"].strip()
+            if t:
+                return t
+    except Exception:
+        pass
+    return None
+
 # --------------------------- TEXT CHAT (pair) ---------------------------
 @app.websocket("/ws/chat_text")
 async def ws_chat_text(websocket: WebSocket):
@@ -173,9 +184,15 @@ async def ws_tts_once(websocket: WebSocket):
 # ---------------------- AUDIO CHAT (NON-STREAMING) ----------------------
 @app.websocket("/ws/audio_chat")
 async def ws_audio_chat(websocket: WebSocket):
+    """
+    Now accepts a TEXT override: client may send {"text":"..."} before DONE
+    to bypass ASR. This matches your ChatPage handshake.
+    """
     await websocket.accept()
     buf = bytearray()
     cur_lang = "fr"
+    typed_text: Optional[str] = None
+
     try:
         asr_general, asr_basaa, llm, m2m, tts, _ = services()
         while True:
@@ -186,39 +203,54 @@ async def ws_audio_chat(websocket: WebSocket):
                 elif msg.get("text"):
                     txt = msg["text"]
                     if _is_stop(txt):
-                        x16 = decode_audio_to_16k_float_mono(bytes(buf))
-                        if x16.size == 0:
-                            await send_json(websocket, "error", message="empty audio")
-                            buf.clear()
-                            continue
-
-                        lang = _norm_lang(cur_lang)
-                        if lang in ("fr","en"):
-                            asr_text = asr_general.transcribe(x16, lang=lang)
+                        # decide input: typed override OR ASR
+                        if typed_text and typed_text.strip():
+                            user_text = typed_text.strip()
+                            lang = _norm_lang(cur_lang)
+                            if lang == "en":
+                                prompt_fr = llm.en_to_fr(user_text)
+                            elif lang == "lg":
+                                prompt_fr = m2m.bas_to_fr(user_text)
+                            else:
+                                prompt_fr = user_text
                         else:
-                            asr_text = asr_basaa.transcribe(x16)
+                            x16 = decode_audio_to_16k_float_mono(bytes(buf))
+                            if x16.size == 0:
+                                await send_json(websocket, "error", message="empty audio")
+                                buf.clear(); continue
 
-                        if lang == "en":
-                            fr_text = llm.en_to_fr(asr_text)
-                        elif lang == "lg":
-                            fr_text = llm.chat_as_fr(m2m.bas_to_fr(asr_text))
-                        else:
-                            fr_text = llm.chat_as_fr(asr_text)
+                            lang = _norm_lang(cur_lang)
+                            if lang in ("fr","en"):
+                                asr_text = asr_general.transcribe(x16, lang=lang)
+                            else:
+                                asr_text = asr_basaa.transcribe(x16)
 
+                            if lang == "en":
+                                prompt_fr = llm.en_to_fr(asr_text)
+                            elif lang == "lg":
+                                prompt_fr = m2m.bas_to_fr(asr_text)
+                            else:
+                                prompt_fr = asr_text
+
+                        fr_text = llm.chat_as_fr(prompt_fr)
                         lg_text = m2m.fr_to_bas(fr_text)
 
                         await websocket.send_text(json.dumps(
-                            {"fr": fr_text, "lg": lg_text, "asr": asr_text},
+                            {"fr": fr_text, "lg": lg_text},
                             ensure_ascii=False
                         ))
 
                         wav = tts.tts(lg_text)
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
-                        buf.clear()
+                        buf.clear(); typed_text = None
                     else:
                         maybe = _maybe_lang(txt)
-                        if maybe: cur_lang = maybe
+                        if maybe:
+                            cur_lang = maybe
+                        else:
+                            t = _maybe_text(txt)
+                            if t: typed_text = t
             elif msg["type"] == "websocket.disconnect":
                 break
     except WebSocketDisconnect:
@@ -229,9 +261,14 @@ async def ws_audio_chat(websocket: WebSocket):
 # ---------------------- TRANSLATE (NON-STREAMING) -----------------------
 @app.websocket("/ws/translate")
 async def ws_translate(websocket: WebSocket):
+    """
+    Also accepts a TEXT override for parity with audio_chat.
+    """
     await websocket.accept()
     buf = bytearray()
     cur_lang = "fr"
+    typed_text: Optional[str] = None
+
     try:
         asr_general, asr_basaa, llm, m2m, tts, _ = services()
         while True:
@@ -242,16 +279,19 @@ async def ws_translate(websocket: WebSocket):
                 elif msg.get("text"):
                     txt = msg["text"]
                     if _is_stop(txt):
-                        x16 = decode_audio_to_16k_float_mono(bytes(buf))
-                        if x16.size == 0:
-                            await send_json(websocket, "error", message="empty audio")
-                            buf.clear(); continue
-
                         lang = _norm_lang(cur_lang)
-                        if lang in ("fr","en"):
-                            asr_text = asr_general.transcribe(x16, lang=lang)
+
+                        if typed_text and typed_text.strip():
+                            asr_text = typed_text.strip()
                         else:
-                            asr_text = asr_basaa.transcribe(x16)
+                            x16 = decode_audio_to_16k_float_mono(bytes(buf))
+                            if x16.size == 0:
+                                await send_json(websocket, "error", message="empty audio")
+                                buf.clear(); typed_text = None; continue
+                            if lang in ("fr","en"):
+                                asr_text = asr_general.transcribe(x16, lang=lang)
+                            else:
+                                asr_text = asr_basaa.transcribe(x16)
 
                         if lang == "en":
                             fr_text = llm.en_to_fr(asr_text)
@@ -268,14 +308,16 @@ async def ws_translate(websocket: WebSocket):
                             ensure_ascii=False
                         ))
 
-                        wav_src_text = lg_text
-                        wav = tts.tts(wav_src_text)
+                        wav = tts.tts(lg_text)
                         await websocket.send_bytes(wav_bytes_from_float32(wav, tts.sr_out))
 
-                        buf.clear()
+                        buf.clear(); typed_text = None
                     else:
                         maybe = _maybe_lang(txt)
                         if maybe: cur_lang = maybe
+                        else:
+                            t = _maybe_text(txt)
+                            if t: typed_text = t
             elif msg["type"] == "websocket.disconnect":
                 break
     except WebSocketDisconnect:
